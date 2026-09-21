@@ -10,7 +10,7 @@ A Codex skill that puts three models in their right places:
 - **Codex/Astra** stays in charge. It authorises what workers may do, verifies
   results against its own evidence, and decides what gets integrated.
 
-About 7,000 lines of Python across 27 modules, standard library only, no
+About 5,800 lines of Python across 29 modules (plus docstrings), standard library only, no
 daemon, no auto-update, and a 366-test suite that proves the security
 properties rather than asserting them.
 
