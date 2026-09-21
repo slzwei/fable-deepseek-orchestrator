@@ -47,7 +47,15 @@ _RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 def _no_proxy_opener() -> urllib.request.OpenerDirector:
-    """An opener that ignores environment proxies and verifies certificates."""
+    """An opener that ignores environment proxies and verifies certificates.
+
+    Passing an explicit ``ProxyHandler({})`` suppresses the default handler that
+    would otherwise read ``HTTPS_PROXY`` and friends from the environment. Note
+    that the empty handler defines no ``*_open`` methods and so does not appear
+    in ``opener.handlers`` - that absence is the point, not a bug. Do not
+    "simplify" this to ``build_opener()``: that reinstates env proxy support and
+    lets a hostile environment variable intercept every prompt.
+    """
     context = ssl.create_default_context()
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED

@@ -198,7 +198,7 @@ class Orchestrator:
         commands = detect_validation_commands(self.repo_root)
         builder.add(
             "Validation commands available to workers",
-            "\n".join(f"  - {c.id}: {c.display()}  # {c.description}" for c in commands),
+            "\n".join(f"- {c.id}: {c.display()}  # {c.description}" for c in commands),
             priority=28,
         )
         return builder.build()

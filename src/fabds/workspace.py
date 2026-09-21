@@ -79,6 +79,10 @@ class Workspace:
     # -- lifecycle ----------------------------------------------------------
 
     def setup(self) -> "Workspace":
+        # Snapshot first: without a baseline, changed_files() reports every
+        # pre-existing file as new, which would defeat the controller's check
+        # that a worker claiming success actually produced changes.
+        self._baseline = self._snapshot()
         return self
 
     def cleanup(self) -> None:

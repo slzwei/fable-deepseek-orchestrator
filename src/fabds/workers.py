@@ -15,6 +15,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ MAX_READ_CHARS = 20_000
 MAX_WRITE_BYTES = 2_000_000
 MAX_SEARCH_RESULTS = 60
 MAX_SEARCH_BYTES = 4_000_000
-MAX_SEARCH_SECONDS = 5.0
+MAX_SEARCH_SECONDS = 10.0
 MAX_PATTERN_CHARS = 200
 MAX_OBSERVATION_CHARS = 12_000
 
@@ -158,30 +159,31 @@ class ActionExecutor:
         return ActionResult(f"list_dir({raw!r})", True, output="\n".join(entries) or "(empty)")
 
     def _search(self, payload: dict) -> ActionResult:
+        """Regex search, executed out of process so its cost is truly bounded.
+
+        The pattern comes from a model, so it is untrusted in the availability
+        sense as well as the security sense: ``re`` cannot be interrupted, and a
+        backtracking pattern would otherwise hang the worker forever. The parent
+        decides which files are eligible; a child process does the matching and
+        is killed if it overruns.
+        """
         pattern = payload["pattern"]
         if len(pattern) > MAX_PATTERN_CHARS:
-            return ActionResult("search", False, error=f"pattern exceeds {MAX_PATTERN_CHARS} characters")
+            return ActionResult("search", False,
+                                error=f"pattern exceeds {MAX_PATTERN_CHARS} characters")
         try:
-            compiled = re.compile(pattern)
+            re.compile(pattern)
         except re.error as exc:
             return ActionResult("search", False, error=f"invalid regex: {exc}")
 
         subtree = payload.get("path") or "."
         base = self.permissions.assert_read(subtree)
-        if base.is_file():
-            candidates = [base]
-        else:
-            candidates = [p for p in sorted(base.rglob("*")) if p.is_file()]
+        candidates = [base] if base.is_file() else [
+            p for p in sorted(base.rglob("*")) if p.is_file()
+        ]
 
-        results: list[str] = []
-        scanned_bytes = 0
-        deadline = time.monotonic() + MAX_SEARCH_SECONDS
+        eligible: list[str] = []
         for path in candidates:
-            if len(results) >= MAX_SEARCH_RESULTS or scanned_bytes >= MAX_SEARCH_BYTES:
-                break
-            if time.monotonic() > deadline:
-                results.append("... [search time budget reached] ...")
-                break
             try:
                 rel = path.resolve(strict=False).relative_to(self.workspace.root).as_posix()
             except ValueError:
@@ -190,28 +192,44 @@ class ActionExecutor:
                 continue
             if any(self.sanitizer.should_skip_dir(part) for part in Path(rel).parts[:-1]):
                 continue
-            try:
-                raw = path.read_bytes()
-            except OSError:
-                continue
-            if b"\x00" in raw[:4096]:
-                continue
-            scanned_bytes += len(raw)
-            for lineno, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), 1):
-                # Long lines are the backtracking risk; skip them rather than
-                # let a pathological pattern stall the run.
-                if len(line) > 2000:
-                    continue
-                if compiled.search(line):
-                    results.append(f"{rel}:{lineno}: {REDACTOR.scrub(line.strip())[:200]}")
-                    if len(results) >= MAX_SEARCH_RESULTS:
-                        break
-                if time.monotonic() > deadline:
-                    break
+            eligible.append(rel)
+
+        job = json.dumps({
+            "root": str(self.workspace.root), "pattern": pattern, "files": eligible,
+            "max_results": MAX_SEARCH_RESULTS, "max_bytes": MAX_SEARCH_BYTES,
+        })
+        scanner = Path(__file__).resolve().parent / "_scan.py"
+        result = run_command(
+            [sys.executable, str(scanner)],
+            cwd=self.workspace.root, env=build_child_env(),
+            stdin_text=job, timeout_s=MAX_SEARCH_SECONDS,
+        )
+        if result.timed_out:
+            return ActionResult(
+                f"search({pattern!r})", False,
+                error=(f"the search was cancelled after {MAX_SEARCH_SECONDS:.0f}s. "
+                       "That pattern is too expensive to evaluate - patterns with "
+                       "nested quantifiers such as (a+)+ backtrack exponentially. "
+                       "Use a simpler pattern or narrow the subtree."),
+            )
+        try:
+            parsed = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return ActionResult(f"search({pattern!r})", False,
+                                error=f"the scanner failed: {result.stderr[:300]}")
+        if "error" in parsed:
+            return ActionResult(f"search({pattern!r})", False, error=parsed["error"])
+
+        matches = parsed.get("matches", [])
+        lines = [
+            f"{m['path']}:{m['line']}: {REDACTOR.scrub(m['text'])}" for m in matches
+        ]
+        if parsed.get("truncated"):
+            lines.append(f"... [stopped at {MAX_SEARCH_RESULTS} matches] ...")
         return ActionResult(
             f"search({pattern!r})", True,
-            output="\n".join(results) if results else "(no matches)",
-            metadata={"matches": len(results), "files_scanned": len(candidates)},
+            output="\n".join(lines) if lines else "(no matches)",
+            metadata={"matches": len(matches), "files_scanned": parsed.get("files_scanned", 0)},
         )
 
     # -- writes -------------------------------------------------------------
