@@ -93,7 +93,8 @@ class WorkPacket:
     validation_command_ids: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
     max_turns: int = 12
-    max_output_tokens: int = 4096
+    #: Writing a whole file plus reasoning needs headroom; DeepSeek caps at 8192.
+    max_output_tokens: int = 8000
     reasoning_effort: str = "high"
     notes: str = ""
 

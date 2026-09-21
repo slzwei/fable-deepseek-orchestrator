@@ -8,6 +8,7 @@ Subcommands
 ``plan``       one planning round, no workers, no file changes
 ``run``        the full orchestration; stages patches, never merges them
 ``integrate``  apply staged patches the controller has decided to accept
+``verify``     run the repository's validation commands against the working tree
 ``runs``       list previous runs in this repository
 ``cache``      inspect, prune or purge the caches
 ``version``    print the version
@@ -34,32 +35,63 @@ from .models import ModelResolver, Role
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_NO_MODEL = 0, 1, 2, 3
 
 
+def _common_flags(*, suppress_defaults: bool) -> argparse.ArgumentParser:
+    """Flags accepted both before and after the subcommand.
+
+    Declaring them only on the top-level parser makes ``fabds run x --json``
+    parse cleanly and then do nothing, which is a trap. Sharing them through a
+    parent parser fixes that, but introduces the opposite trap: a subparser
+    writes its *defaults* into the same namespace and clobbers a value the
+    top-level parser already set, so ``fabds --json run x`` would break instead.
+
+    Using ``SUPPRESS`` on the subparser copy means it only assigns when the flag
+    was actually typed, so both positions work and the last one wins.
+    """
+    common = argparse.ArgumentParser(add_help=False)
+    default = argparse.SUPPRESS if suppress_defaults else None
+
+    def add(*names, **kwargs):
+        if suppress_defaults:
+            kwargs["default"] = argparse.SUPPRESS
+        common_target.add_argument(*names, **kwargs)
+
+    common_target = common
+    add("-C", "--repo", **({} if suppress_defaults else {"default": "."}),
+        metavar="PATH", help="repository to operate on (default: the current directory)")
+    common_target = common.add_mutually_exclusive_group()
+    add("-v", "--verbose", action="count",
+        **({} if suppress_defaults else {"default": 0}),
+        help="more detail; repeat for debug output")
+    add("-q", "--quiet", action="store_true", help="errors only")
+    common_target = common
+    add("--json", action="store_true", help="machine-readable output on stdout")
+    add("--no-cache", action="store_true", help="bypass the plan and analysis caches")
+    return common
+
+
 def build_parser() -> argparse.ArgumentParser:
+    top = _common_flags(suppress_defaults=False)
+    common = _common_flags(suppress_defaults=True)
     parser = argparse.ArgumentParser(
         prog="fabds",
         description="Fable plans, DeepSeek executes, the controller decides.",
+        parents=[top],
     )
     parser.add_argument("--version", action="version", version=f"fabds {__version__}")
-    parser.add_argument("-C", "--repo", default=".", metavar="PATH",
-                        help="repository to operate on (default: the current directory)")
-    verbosity = parser.add_mutually_exclusive_group()
-    verbosity.add_argument("-v", "--verbose", action="count", default=0,
-                           help="more detail; repeat for debug output")
-    verbosity.add_argument("-q", "--quiet", action="store_true", help="errors only")
-    parser.add_argument("--json", action="store_true", help="machine-readable output on stdout")
-    parser.add_argument("--no-cache", action="store_true", help="bypass the plan and analysis caches")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    doctor = sub.add_parser("doctor", help="check the environment and security properties")
+    doctor = sub.add_parser("doctor", parents=[common],
+                            help="check the environment and security properties")
     doctor.add_argument("--quick", action="store_true",
                         help="skip the live MCP isolation probe")
 
-    resolve = sub.add_parser("resolve", help="show the resolved model for each role")
+    resolve = sub.add_parser("resolve", parents=[common],
+                             help="show the resolved model for each role")
     resolve.add_argument("--refresh", action="store_true", help="ignore the resolution cache")
 
     for name, help_text in (("run", "plan, delegate, verify"), ("plan", "plan only")):
-        command = sub.add_parser(name, help=help_text)
+        command = sub.add_parser(name, parents=[common], help=help_text)
         command.add_argument("task", help="what you want done")
         command.add_argument("--constraints", default="", help="constraints the plan must respect")
         command.add_argument("--focus", action="append", default=[], metavar="PATH",
@@ -68,6 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--max-tasks", type=int, default=None)
         command.add_argument("--base-rev", default="HEAD",
                              help="revision each worker workspace starts from")
+        command.add_argument("--packets", default=None, metavar="FILE",
+                             help="a JSON decomposition you wrote yourself, instead of "
+                                  "calling the planner (same schema the planner emits)")
         if name == "run":
             command.add_argument("--dry-run", action="store_true",
                                  help="show what would happen; call nothing, change nothing")
@@ -76,14 +111,20 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--final-review", action="store_true",
                                  help="always run a closing adversarial review")
 
-    integrate = sub.add_parser("integrate", help="apply staged patches")
+    integrate = sub.add_parser("integrate", parents=[common], help="apply staged patches")
     integrate.add_argument("task_ids", nargs="+", metavar="TASK_ID")
     integrate.add_argument("--run", dest="run_id", default=None, help="run id (default: the latest)")
     integrate.add_argument("--check", action="store_true", help="test whether patches apply")
+    integrate.add_argument("--verify", action="store_true",
+                           help="run the repository's validation commands afterwards")
 
-    sub.add_parser("runs", help="list runs recorded in this repository")
+    sub.add_parser("verify", parents=[common],
+                   help="run the repository's validation commands against the working tree")
 
-    cache = sub.add_parser("cache", help="inspect or clear the caches")
+    sub.add_parser("runs", parents=[common],
+                   help="list runs recorded in this repository")
+
+    cache = sub.add_parser("cache", parents=[common], help="inspect or clear the caches")
     cache.add_argument("action", choices=("stats", "prune", "purge"))
     cache.add_argument("--namespace", choices=("plan", "analysis"), default=None)
 
@@ -179,6 +220,7 @@ def _run_common(args, *, plan_only: bool) -> int:
         dry_run=getattr(args, "dry_run", False) or plan_only,
         final_review=getattr(args, "final_review", False),
         base_rev=args.base_rev,
+        packets_file=Path(args.packets).expanduser() if args.packets else None,
     ) if not plan_only else _plan_only(orchestrator, args)
 
     if args.json:
@@ -252,12 +294,31 @@ def cmd_integrate(args) -> int:
         print("no runs found in this repository", file=sys.stderr)
         return EXIT_USAGE
     orchestrator = Orchestrator(config, repo, logger=RunLogger(level=_level(args)), run_id=run_id)
-    report = orchestrator.integrate(args.task_ids, check_only=args.check)
+    report = orchestrator.integrate(args.task_ids, check_only=args.check, verify=args.verify)
     lines = [f"run {run_id}"]
     lines += [f"  applied  {entry['task_id']}" for entry in report["applied"]]
     lines += [f"  rejected {entry['task_id']}: {entry['reason']}" for entry in report["rejected"]]
+    verification = report.get("verification")
+    if verification:
+        for check in verification["checks"]:
+            lines.append(f"  verify   {check['command_id']}: "
+                         f"{'passed' if check['passed'] else 'FAILED'}")
     _emit(args, report, lines)
-    return EXIT_OK if not report["rejected"] else EXIT_FAILED
+    failed = bool(report["rejected"]) or (
+        verification is not None and verification.get("all_passed") is False)
+    return EXIT_FAILED if failed else EXIT_OK
+
+
+def cmd_verify(args) -> int:
+    from .orchestrator import Orchestrator
+
+    config, repo = _config(args)
+    orchestrator = Orchestrator(config, repo, logger=RunLogger(level=_level(args)))
+    report = orchestrator.verify()
+    lines = [f"  {c['command_id']}: {'passed' if c['passed'] else 'FAILED'} "
+             f"(exit {c['returncode']})" for c in report["checks"]]
+    _emit(args, report, lines or ["  (no validation command available)"])
+    return EXIT_OK if report["all_passed"] is not False else EXIT_FAILED
 
 
 def cmd_runs(args) -> int:
@@ -292,6 +353,7 @@ def cmd_cache(args) -> int:
 COMMANDS = {
     "doctor": cmd_doctor, "resolve": cmd_resolve, "run": cmd_run, "plan": cmd_plan,
     "integrate": cmd_integrate, "runs": cmd_runs, "cache": cmd_cache,
+    "verify": cmd_verify,
 }
 
 

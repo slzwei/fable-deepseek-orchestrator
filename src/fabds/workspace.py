@@ -30,15 +30,37 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .errors import WorkspaceError
 from .pathsafety import resolve_within
 
 __all__ = [
     "Workspace", "GitWorktreeWorkspace", "CopyWorkspace", "ReadOnlyWorkspace",
-    "create_workspace", "supports_worktrees",
+    "create_workspace", "supports_worktrees", "is_generated_artefact",
 ]
+
+#: Build and cache output. Running a validation command creates these, so
+#: without filtering, every worker that runs its tests appears to have modified
+#: files it does not own - which both falsifies `claims_contradicted` and bakes
+#: compiled bytecode into the exported patch.
+_ARTEFACT_DIRS = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    "node_modules", ".gradle", ".terraform", "htmlcov", ".coverage",
+    ".next", ".nuxt", ".parcel-cache", "dist", "build", ".DS_Store",
+})
+_ARTEFACT_SUFFIXES = (".pyc", ".pyo", ".pyd", ".class", ".o", ".so.tmp")
+_ARTEFACT_NAMES = frozenset({".coverage", ".DS_Store", "coverage.xml", ".fabds"})
+
+
+def is_generated_artefact(relative: str) -> bool:
+    """True for build or cache output that a worker did not meaningfully author."""
+    parts = PurePosixPath(relative).parts
+    if any(part in _ARTEFACT_DIRS for part in parts):
+        return True
+    if any(part in _ARTEFACT_NAMES for part in parts):
+        return True
+    return relative.endswith(_ARTEFACT_SUFFIXES)
 
 
 def _git(root: Path, *args: str, timeout: int = 120, check: bool = True) -> str:
@@ -104,7 +126,7 @@ class Workspace:
             set(current) ^ set(self._baseline)
             | {p for p in current if p in self._baseline and current[p] != self._baseline[p]}
         )
-        return changed
+        return [path for path in changed if not is_generated_artefact(path)]
 
     def diff(self) -> str:
         return ""
@@ -124,6 +146,8 @@ class Workspace:
         snapshot: dict[str, str] = {}
         for path in self.root.rglob("*"):
             if path.is_dir() or ".git" in path.parts:
+                continue
+            if any(part in _ARTEFACT_DIRS for part in path.parts):
                 continue
             try:
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
@@ -191,14 +215,21 @@ class GitWorktreeWorkspace(Workspace):
                     changed.extend(part.strip() for part in path.split(" -> "))
                 else:
                     changed.append(path)
-        return sorted(set(changed))
+        return sorted(p for p in set(changed) if not is_generated_artefact(p))
+
+    def _stage(self) -> None:
+        """Stage only real changes; never compiled output from a test run."""
+        paths = self.changed_files()
+        if not paths:
+            return
+        _git(self.root, "add", "--force", "--", *paths, check=False)
 
     def diff(self) -> str:
-        _git(self.root, "add", "--all", check=False)   # the worktree has its own index
+        self._stage()   # the worktree has its own index; the user's is untouched
         return _git(self.root, "diff", "--cached", check=False)
 
     def export_patch(self) -> str:
-        _git(self.root, "add", "--all", check=False)
+        self._stage()
         return _git(self.root, "diff", "--cached", "--binary", check=False)
 
     def cleanup(self) -> None:

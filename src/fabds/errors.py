@@ -76,6 +76,13 @@ class EmptyResponse(MalformedResponse):
     retryable = True
 
 
+class ResponseTruncated(MalformedResponse):
+    """The model hit its output budget mid-reply."""
+
+    code = "response_truncated"
+    retryable = True
+
+
 class PathSafetyError(FabdsError):
     code = "path_safety_violation"
 

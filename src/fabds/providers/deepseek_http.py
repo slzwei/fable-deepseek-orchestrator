@@ -36,6 +36,7 @@ from ..errors import (
     ProviderRateLimited,
     ProviderTimeout,
     ProviderUnavailable,
+    ResponseTruncated,
 )
 from ..redaction import REDACTOR
 from .base import CompletionRequest, DiscoveredModel, ModelResponse, ProviderStatus
@@ -157,6 +158,13 @@ class DeepSeekHttpProvider:
         text = _extract_text(message)
         finish = choices[0].get("finish_reason")
         if not text.strip():
+            if finish == "length":
+                # The whole budget went on reasoning, leaving no answer. Worth a
+                # retry with a hint; a flat "empty response" would hide the cause.
+                raise ResponseTruncated(
+                    "DeepSeek used its entire output budget before producing an "
+                    "answer (finish_reason=length)"
+                )
             raise EmptyResponse(
                 f"DeepSeek returned empty content (finish_reason={finish})"
             )

@@ -21,6 +21,7 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from . import __version__
@@ -28,6 +29,7 @@ from .cache import FileCache
 from .config import Config
 from .context import ContextBuilder, ContextPacket, git_state, repo_identity
 from .errors import (
+    ConfigError,
     FabdsError,
     LimitExceeded,
     ModelResolutionError,
@@ -48,6 +50,17 @@ from .workspace import create_workspace, supports_worktrees
 __all__ = ["Orchestrator", "RunOutcome", "detect_validation_commands"]
 
 
+@lru_cache(maxsize=8)
+def _module_available(module: str) -> bool:
+    """Is ``module`` importable by the interpreter a worker command would use?
+
+    Offering a command that cannot run wastes a worker turn and produces a
+    confusing failure that looks like the worker's fault. Checked once per
+    process.
+    """
+    return run_command(["python3", "-c", f"import {module}"], timeout_s=60).ok
+
+
 def detect_validation_commands(repo_root: Path) -> list[CommandSpec]:
     """Infer a small, safe validation allowlist from repository conventions.
 
@@ -57,13 +70,29 @@ def detect_validation_commands(repo_root: Path) -> list[CommandSpec]:
     root = Path(repo_root)
     specs: list[CommandSpec] = []
 
-    has_pytest = any((root / name).exists() for name in
-                     ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "tests", "test"))
-    if has_pytest:
-        specs.append(CommandSpec(
-            "pytest", ("python3", "-m", "pytest", "-q"),
-            "run the Python test suite", timeout_s=900, max_extra_paths=1,
-        ))
+    looks_python = any((root / name).exists() for name in
+                       ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "tests", "test"))
+    if looks_python:
+        if _module_available("pytest"):
+            specs.append(CommandSpec(
+                "pytest", ("python3", "-m", "pytest", "-q"),
+                "run the Python test suite", timeout_s=900, max_extra_paths=1,
+            ))
+        else:
+            # pytest is not importable here, so offering it would guarantee a
+            # confusing failure. unittest is always present - but plain
+            # `discover` silently finds nothing when tests/ is not an importable
+            # package, which is the common layout. Point it at the directory and
+            # make that directory the import root.
+            tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
+            if tests_dir and not (root / tests_dir / "__init__.py").exists():
+                argv = ("python3", "-m", "unittest", "discover",
+                        "-s", tests_dir, "-t", tests_dir)
+            else:
+                argv = ("python3", "-m", "unittest", "discover")
+            specs.append(CommandSpec(
+                "unittest", argv, "run the standard-library test suite", timeout_s=900,
+            ))
         specs.append(CommandSpec(
             "py_compile", ("python3", "-m", "compileall", "-q", "."),
             "byte-compile the tree to catch syntax errors", timeout_s=300,
@@ -224,7 +253,8 @@ class Orchestrator:
 
         command_map = {c.id: c for c in commands}
         validation_ids = tuple(
-            cid for cid in ("pytest", "npm_test", "make_test") if cid in command_map
+            cid for cid in ("pytest", "unittest", "npm_test", "make_test")
+            if cid in command_map
         )
         packets: list[WorkPacket] = []
         known_ids = {p.task_id for p in proposals}
@@ -379,9 +409,51 @@ class Orchestrator:
 
     # -- the run ------------------------------------------------------------
 
+    def load_packets(self, path: Path) -> "list[PlannedPacket]":
+        """Read a controller-authored decomposition.
+
+        The same schema the planner emits, so a controller can hand-write a
+        decomposition, or edit one Fable produced, without involving the planner
+        at all. These are still only *proposals*: they go through authorise()
+        exactly like a planner's, so commands and read-only rules are applied by
+        the controller either way.
+        """
+        import json as _json
+
+        try:
+            data = _json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"cannot read packets file {path}: {exc}") from exc
+        entries = data.get("packets") if isinstance(data, dict) else data
+        if not isinstance(entries, list) or not entries:
+            raise ConfigError(f"{path} contains no packets")
+
+        proposals: list[PlannedPacket] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                raise ConfigError(f"packet {index} in {path} is not an object")
+            try:
+                kind = TaskKind(str(entry.get("kind", "implement")).lower())
+            except ValueError as exc:
+                raise ConfigError(
+                    f"packet {index} has unknown kind {entry.get('kind')!r}") from exc
+            proposals.append(PlannedPacket(
+                task_id=str(entry.get("task_id") or f"task_{index + 1:02d}"),
+                kind=kind,
+                objective=str(entry.get("objective", "")),
+                owned_paths=() if kind.read_only else tuple(entry.get("owned_paths", ())),
+                readonly_paths=tuple(entry.get("readonly_paths", ())),
+                acceptance_criteria=tuple(entry.get("acceptance_criteria", ())),
+                depends_on=tuple(entry.get("depends_on", ())),
+                parallel_safe=bool(entry.get("parallel_safe", True)),
+                rationale=str(entry.get("context") or entry.get("rationale", "")),
+            ))
+        return proposals
+
     def run(self, *, task: str, constraints: str = "", focus_paths=(),
             use_planner: bool = True, dry_run: bool = False,
-            final_review: bool = False, base_rev: str = "HEAD") -> RunOutcome:
+            final_review: bool = False, base_rev: str = "HEAD",
+            packets_file: "Path | None" = None) -> RunOutcome:
         outcome = RunOutcome(run_id=self.run_id, ok=False, task=task,
                              ledger_root=str(self.ledger.root), dry_run=dry_run)
         try:
@@ -398,7 +470,8 @@ class Orchestrator:
         state = git_state(self.repo_root)
 
         if dry_run:
-            return self._dry_run(outcome, models, context, commands, task, use_planner)
+            return self._dry_run(outcome, models, context, commands, task, use_planner,
+                                 packets_file=packets_file)
 
         from .providers import get_provider
 
@@ -414,7 +487,19 @@ class Orchestrator:
         )
 
         try:
-            if use_planner:
+            if packets_file is not None:
+                proposals = self.load_packets(packets_file)
+                self.logger.info(
+                    "planner",
+                    f"skipped: using {len(proposals)} controller-authored packet(s) "
+                    f"from {packets_file}",
+                )
+                plan = Plan(
+                    approach=f"Controller-authored decomposition from {packets_file}.",
+                    packets=tuple(proposals),
+                    verification_strategy="the controller's own validation commands",
+                )
+            elif use_planner:
                 plan = planner.plan(
                     task=task, constraints=constraints, context=context,
                     repo_identity=repo_identity(self.repo_root), git_state=state,
@@ -526,18 +611,25 @@ class Orchestrator:
     # -- dry run ------------------------------------------------------------
 
     def _dry_run(self, outcome: RunOutcome, models: dict, context: ContextPacket,
-                 commands: "list[CommandSpec]", task: str, use_planner: bool) -> RunOutcome:
-        plan = self._fallback_plan(task)
+                 commands: "list[CommandSpec]", task: str, use_planner: bool,
+                 packets_file: "Path | None" = None) -> RunOutcome:
+        if packets_file is not None:
+            plan = Plan(approach=f"Controller-authored decomposition from {packets_file}.",
+                        packets=tuple(self.load_packets(packets_file)))
+        else:
+            plan = self._fallback_plan(task)
         packets = self.authorise(list(plan.packets), commands=commands)
         outcome.ok = True
+        if packets_file is not None:
+            note = f"No model was called. These are your own packets from {packets_file}."
+        elif use_planner:
+            note = ("No model was called. With the planner enabled the real packets come "
+                    "from the planner's response; the packet below is the controller's own "
+                    "fallback decomposition.")
+        else:
+            note = "The planner is disabled for this run; this is the packet that would run."
         outcome.plan = {
-            "note": (
-                "No model was called. With the planner enabled the real packets come "
-                "from the planner's response; the packet below is the controller's own "
-                "fallback decomposition."
-                if use_planner else
-                "The planner is disabled for this run; this is the packet that would run."
-            ),
+            "note": note,
             **plan.as_dict(),
         }
         outcome.packets = [p.as_dict() for p in packets]
@@ -579,7 +671,46 @@ class Orchestrator:
 
     # -- integration --------------------------------------------------------
 
-    def integrate(self, task_ids: "list[str]", *, check_only: bool = False) -> dict:
+    def verify(self, *, commands: "list[CommandSpec] | None" = None) -> dict:
+        """Run the repository's validation commands against the working tree.
+
+        Packets are verified in isolation, which is necessary but not
+        sufficient: a test packet written in one worktree cannot see an
+        implementation written in another, and two patches that each apply
+        cleanly can still be wrong together. This is the check that covers the
+        integrated result, and it is the one that actually decides whether the
+        task is done.
+        """
+        commands = commands or detect_validation_commands(self.repo_root)
+        wanted = {"pytest", "unittest", "npm_test", "make_test"}
+        checks = []
+        for spec in commands:
+            if spec.id not in wanted:
+                continue
+            result = run_command(
+                list(spec.argv), cwd=self.repo_root, env=build_child_env(),
+                timeout_s=min(spec.timeout_s, self.config.limits.command_timeout_s),
+            )
+            checks.append({
+                "command_id": spec.id, "argv": list(spec.argv),
+                "returncode": result.returncode, "timed_out": result.timed_out,
+                "passed": result.ok,
+                "tail": result.stdout[-3000:] + ("\n" + result.stderr[-1500:] if result.stderr else ""),
+            })
+            self.logger.info(
+                "controller",
+                f"integrated check {spec.id}: {'passed' if result.ok else 'FAILED'}",
+            )
+        report = {"checks": checks,
+                  "all_passed": all(c["passed"] for c in checks) if checks else None}
+        if not checks:
+            self.logger.warn("controller",
+                             "no validation command was available; nothing was verified")
+        self.ledger.write_json("verification.json", report)
+        return report
+
+    def integrate(self, task_ids: "list[str]", *, check_only: bool = False,
+                  verify: bool = False) -> dict:
         """Apply staged patches to the repository. Explicit, never automatic."""
         report = {"applied": [], "rejected": [], "check_only": check_only}
         for task_id in task_ids:
@@ -603,5 +734,7 @@ class Orchestrator:
                 })
                 self.logger.warn("controller",
                                  f"patch for {task_id} does not apply: {result.stderr.strip()[:200]}")
+        if verify and not check_only and report["applied"]:
+            report["verification"] = self.verify()
         self.ledger.write_json("integration.json", report)
         return report

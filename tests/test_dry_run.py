@@ -134,3 +134,24 @@ def test_cli_dry_run_end_to_end(git_repo, tmp_path):
     payload = json.loads(result.stdout)
     assert payload["dry_run"] is True
     assert payload["ok"] is True
+
+
+def test_common_flags_work_in_either_position():
+    """`fabds run x --json` must not be silently ignored."""
+    from fabds.cli import build_parser
+
+    parser = build_parser()
+    before = parser.parse_args(["--json", "-v", "-C", "/tmp", "run", "task"])
+    after = parser.parse_args(["run", "task", "--json", "-v", "-C", "/tmp"])
+    for parsed in (before, after):
+        assert parsed.json is True
+        assert parsed.verbose == 1
+        assert parsed.repo == "/tmp"
+        assert parsed.task == "task"
+
+
+def test_unknown_flags_still_error():
+    from fabds.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "task", "--not-a-real-flag"])

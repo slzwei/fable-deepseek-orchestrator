@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .errors import (
     ContextTooLarge,
+    EmptyResponse,
     FabdsError,
     MalformedResponse,
     ModelAttestationError,
@@ -394,6 +395,24 @@ class WorkerRunner:
             try:
                 response, attempts_used = self._complete("\n\n".join(transcript), turn, attempts)
                 attempts = attempts_used
+            except (MalformedResponse, EmptyResponse) as exc:
+                # The provider answered, but the answer was unusable. Spend a
+                # turn telling the model why instead of killing the worker.
+                envelope.turns_used = turn
+                self.logger.warn(
+                    f"worker:{self.packet.task_id}",
+                    f"turn {turn}: {exc.code}, re-prompting with a smaller-output hint",
+                )
+                transcript.append(
+                    f"Your previous reply was unusable ({exc.message}). "
+                    "Reply with ONE small JSON object. If you were writing a large "
+                    "file, write it in smaller pieces across separate turns, and do "
+                    "not restate anything you have already said."
+                )
+                if turn >= self.max_turns:
+                    envelope.status = TaskStatus.FAILED
+                    envelope.error = exc.as_dict()
+                continue
             except FabdsError as exc:
                 envelope.status = TaskStatus.FAILED
                 envelope.error = exc.as_dict()
