@@ -1,0 +1,95 @@
+{
+  "fabds_version": "0.1.0",
+  "expensive_model": "claude-opus-5",
+  "task": "Implement readability_score(text) per README.md and add tests for it.",
+  "arms": [
+    {
+      "arm": "A",
+      "label": "one expensive agent, no delegation",
+      "planner_calls": 0,
+      "worker_calls": 9,
+      "planner_model": "claude-opus-5",
+      "worker_model": "claude-opus-5",
+      "wall_clock_s": 63.7,
+      "prompt_chars_sent": 97596,
+      "packets": 1,
+      "packets_completed": 1,
+      "files_touched": [
+        "src/textstats/__init__.py",
+        "src/textstats/core.py",
+        "tests/test_readability.py"
+      ],
+      "duplicated_files": [],
+      "cost_usd_reported": 0.5860970000000001,
+      "worker_tokens": {
+        "worker.input_tokens": 18,
+        "worker.output_tokens": 10791
+      },
+      "integrated_tests_passed": true,
+      "task_completed": true,
+      "notes": [
+        "planner role filled by claude-opus-5, not Fable 5.1 (quota exhausted at benchmark time)"
+      ]
+    },
+    {
+      "arm": "B",
+      "label": "expensive model plans and implements every packet",
+      "planner_calls": 3,
+      "worker_calls": 16,
+      "planner_model": "claude-opus-5",
+      "worker_model": "claude-opus-5",
+      "wall_clock_s": 87.8,
+      "prompt_chars_sent": 155182,
+      "packets": 3,
+      "packets_completed": 3,
+      "files_touched": [
+        "src/textstats/__init__.py",
+        "src/textstats/core.py",
+        "tests/test_readability.py"
+      ],
+      "duplicated_files": [],
+      "cost_usd_reported": 1.101258,
+      "worker_tokens": {
+        "planner.input_tokens": 6,
+        "planner.output_tokens": 3148,
+        "worker.input_tokens": 32,
+        "worker.output_tokens": 20450
+      },
+      "integrated_tests_passed": true,
+      "task_completed": true,
+      "notes": [
+        "planner role filled by claude-opus-5, not Fable 5.1 (quota exhausted at benchmark time)"
+      ]
+    },
+    {
+      "arm": "C",
+      "label": "architecture once, then a cheap worker swarm",
+      "planner_calls": 1,
+      "worker_calls": 18,
+      "planner_model": "claude-opus-5",
+      "worker_model": "deepseek-flash",
+      "wall_clock_s": 85.7,
+      "prompt_chars_sent": 148488,
+      "packets": 3,
+      "packets_completed": 3,
+      "files_touched": [
+        "src/textstats/__init__.py",
+        "src/textstats/core.py",
+        "tests/test_readability.py"
+      ],
+      "duplicated_files": [],
+      "cost_usd_reported": 0.031075,
+      "worker_tokens": {
+        "planner.input_tokens": 2,
+        "planner.output_tokens": 961,
+        "worker.prompt_tokens": 39507,
+        "worker.completion_tokens": 38609
+      },
+      "integrated_tests_passed": true,
+      "task_completed": true,
+      "notes": [
+        "planner role filled by claude-opus-5, not Fable 5.1 (quota exhausted at benchmark time)"
+      ]
+    }
+  ]
+}

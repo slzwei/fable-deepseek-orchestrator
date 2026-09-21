@@ -149,16 +149,8 @@ def _config(args):
         limits["max_total_tasks"] = args.max_tasks
     if limits:
         overrides["limits"] = limits
-    config = load_config(repo, overrides)
-    if config.deepseek_api_key_file is None:
-        # Fall back to the DeepSeek MCP server's configured key file when the
-        # user already has one; still a path, never a value.
-        default = Path.home() / "quantlab" / "ds-api-key"
-        if default.is_file():
-            from dataclasses import replace
-
-            config = replace(config, deepseek_api_key_file=default)
-    return config, repo
+    # Key-file discovery lives in load_config so the CLI and library agree.
+    return load_config(repo, overrides), repo
 
 
 def _emit(args, payload: dict, text_lines: "list[str]") -> None:

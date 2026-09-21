@@ -20,7 +20,15 @@ from pathlib import Path
 
 from .errors import ConfigError
 
-__all__ = ["Limits", "ModelConfig", "Config", "load_config", "default_max_workers"]
+__all__ = ["Limits", "ModelConfig", "Config", "load_config", "default_max_workers",
+           "KEY_FILE_CANDIDATES"]
+
+#: Conventional locations checked when no key file is configured. Paths only -
+#: the value is never read here, only located.
+KEY_FILE_CANDIDATES: tuple[str, ...] = (
+    "~/.config/fabds/deepseek-api-key",
+    "~/.deepseek-api-key",
+)
 
 
 def default_max_workers() -> int:
@@ -205,12 +213,27 @@ def load_config(repo_root: Path | None = None, overrides: dict | None = None) ->
     config = replace(config, source_files=tuple(loaded))
 
     if config.deepseek_api_key_file is None:
-        env_file = os.environ.get("DEEPSEEK_API_KEY_FILE")
-        if env_file:
-            config = replace(config, deepseek_api_key_file=Path(env_file).expanduser())
+        config = replace(config, deepseek_api_key_file=_discover_key_file())
 
     config.validate()
     return config
+
+
+def _discover_key_file() -> Path | None:
+    """Locate a DeepSeek key file without reading it.
+
+    Discovery belongs here rather than in the CLI so that library callers - the
+    benchmark, tests, anything embedding the orchestrator - behave identically
+    to the command line.
+    """
+    env_file = os.environ.get("DEEPSEEK_API_KEY_FILE")
+    if env_file:
+        return Path(env_file).expanduser()
+    for candidate in KEY_FILE_CANDIDATES:
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return path
+    return None
 
 
 def _apply(config: Config, data: dict, source: Path) -> Config:
