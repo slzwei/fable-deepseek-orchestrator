@@ -169,7 +169,7 @@ def _run_common(args, *, plan_only: bool) -> int:
     config, repo = _config(args)
     logger = RunLogger(level=_level(args))
     orchestrator = Orchestrator(config, repo, logger=logger)
-    logger.jsonl_path = orchestrator.ledger.events_path
+    logger.attach_jsonl(orchestrator.ledger.events_path)
 
     outcome = orchestrator.run(
         task=args.task,

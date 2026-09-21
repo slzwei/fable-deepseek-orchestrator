@@ -197,13 +197,29 @@ class ClaudeCliProvider:
         # smells like a credential is dropped by build_child_env itself.
         return build_child_env()
 
-    def _base_argv(self, executable: str, model_id: str) -> list[str]:
-        return [
+    def _base_argv(self, executable: str, model_id: str, *,
+                   mcp_grants: "dict | None" = None) -> list[str]:
+        """Build the isolated invocation.
+
+        ``--safe-mode`` disables *all* customisation, MCP servers included, and
+        that override beats ``--mcp-config``: with it on, even an explicitly
+        granted server does not start (verified against the installed CLI). So
+        when the controller deliberately grants a server, ``--safe-mode`` is
+        dropped, because silently ignoring a requested capability would be worse
+        than the narrower isolation. Everything else - strict MCP config, no
+        settings inheritance, no tools, neutral cwd, scrubbed environment -
+        stays in force either way, and the response records
+        ``mcp_isolated=False`` so the reduction is visible downstream.
+        """
+        argv = [
             executable,
             "--print",
             "--output-format", "json",
             "--model", model_id,
-            "--safe-mode",
+        ]
+        if not mcp_grants:
+            argv.append("--safe-mode")
+        argv += [
             "--strict-mcp-config",
             "--setting-sources", "",
             "--tools", "",
@@ -211,13 +227,14 @@ class ClaudeCliProvider:
             "--permission-prompts", "none",
             "--no-session-persistence",
         ]
+        return argv
 
     def complete(self, request: CompletionRequest) -> ModelResponse:
         which = shutil.which(self.executable)
         if not which:
             raise ProviderUnavailable(f"{self.executable!r} is not on PATH")
 
-        argv = self._base_argv(which, request.model_id)
+        argv = self._base_argv(which, request.model_id, mcp_grants=request.mcp_grants)
         if request.system_prompt:
             argv += ["--system-prompt", request.system_prompt]
 

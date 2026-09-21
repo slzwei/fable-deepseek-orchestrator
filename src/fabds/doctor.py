@@ -272,9 +272,11 @@ def probe_isolation(claude_path: str, *, timeout_s: float = 120,
 
         granted_script = write_probe(base / "probe2", granted_marker)
         grant = _json.dumps(probe_config(granted_script, granted_marker))
+        # No --safe-mode here: it disables MCP wholesale and would beat the
+        # grant. The provider drops it for granted calls for the same reason.
         run_command(
             common + [
-                "--safe-mode", "--strict-mcp-config", "--mcp-config", grant,
+                "--strict-mcp-config", "--mcp-config", grant,
                 "--setting-sources", "", "--permission-prompts", "none",
                 "--no-session-persistence", "ping",
             ],

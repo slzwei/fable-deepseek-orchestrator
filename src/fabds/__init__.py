@@ -17,14 +17,29 @@ from pathlib import Path
 
 __all__ = ["__version__", "VERSION_FILE"]
 
-VERSION_FILE = Path(__file__).resolve().parents[2] / "VERSION"
+def _version_candidates() -> list[Path]:
+    """VERSION sits beside the checkout in development and beside the package
+    once installed, so both layouts are checked."""
+    here = Path(__file__).resolve()
+    return [
+        here.parents[2] / "VERSION",   # <repo>/VERSION with src/fabds/
+        here.parents[1] / "VERSION",   # <skill>/orchestrator/VERSION
+        here.parent / "VERSION",
+    ]
+
+
+VERSION_FILE = _version_candidates()[0]
 
 
 def _read_version() -> str:
-    try:
-        return VERSION_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return "0.0.0+unknown"
+    for candidate in _version_candidates():
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    return "0.0.0+unknown"
 
 
 __version__ = _read_version()

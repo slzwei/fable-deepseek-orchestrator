@@ -63,6 +63,11 @@ class RunLogger:
 
     # -- public API ---------------------------------------------------------
 
+    def attach_jsonl(self, path) -> None:
+        """Point the JSONL sink at a run directory after construction."""
+        self.jsonl_path = Path(path)
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
     def event(self, component: str, message: str, *, level: Level = Level.NORMAL,
               kind: str = "info", **fields: Any) -> None:
         safe_message = REDACTOR.scrub(str(message))

@@ -1,0 +1,9 @@
+interface:
+  display_name: "Fable/DeepSeek Orchestrator"
+  short_description: "Fable plans, DeepSeek workers implement in isolated worktrees, you verify and integrate"
+  default_prompt: >-
+    Use $fable-deepseek-orchestrator to plan this task with Fable 5.1, delegate
+    bounded packets to DeepSeek V4.1 Flash workers, then review, verify and
+    integrate the results yourself.
+policy:
+  allow_implicit_invocation: true

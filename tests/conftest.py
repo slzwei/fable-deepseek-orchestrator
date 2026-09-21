@@ -80,6 +80,15 @@ def null_logger():
 
 
 @pytest.fixture
+def recording_logger(tmp_path):
+    """Quiet on the terminal, but writes the JSONL event stream like the CLI does."""
+    from fabds.logging import Level, RunLogger
+
+    return RunLogger(level=Level.QUIET,
+                     stream=open(tmp_path / "stderr.txt", "w", encoding="utf-8"))
+
+
+@pytest.fixture
 def config(tmp_path) -> Config:
     return replace(
         load_config(),
