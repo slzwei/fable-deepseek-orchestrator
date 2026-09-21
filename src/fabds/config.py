@@ -109,6 +109,10 @@ class Config:
     extra_secret_paths: tuple[str, ...] = ()
     context_allowlist: tuple[str, ...] = ()
 
+    #: Controller-authored command allowlist, offered to workers by id.
+    #: Every entry becomes a CommandSpec; models select ids, never argv.
+    commands: tuple[dict, ...] = ()
+
     source_files: tuple[Path, ...] = ()
 
     def with_limits(self, **kwargs) -> "Config":
@@ -117,8 +121,26 @@ class Config:
     def with_models(self, **kwargs) -> "Config":
         return replace(self, models=replace(self.models, **kwargs))
 
+    def command_specs(self):
+        """Materialise the configured commands, validating each against policy."""
+        from .permissions import CommandSpec
+
+        specs = []
+        for entry in self.commands:
+            if not isinstance(entry, dict) or "id" not in entry or "argv" not in entry:
+                raise ConfigError("each command needs at least `id` and `argv`")
+            specs.append(CommandSpec(
+                id=str(entry["id"]),
+                argv=tuple(str(a) for a in entry["argv"]),
+                description=str(entry.get("description", "")),
+                timeout_s=int(entry.get("timeout_s", 300)),
+                max_extra_paths=int(entry.get("max_extra_paths", 0)),
+            ))
+        return specs
+
     def validate(self) -> None:
         self.limits.validate()
+        self.command_specs()
         if self.models.allow_model_fallback and not (
             self.models.planner_fallback or self.models.worker_fallback
         ):
@@ -222,6 +244,10 @@ def _apply(config: Config, data: dict, source: Path) -> Config:
         elif key == "deepseek_api_key_file":
             updates[key] = Path(str(value)).expanduser()
         elif key in ("extra_secret_paths", "context_allowlist"):
+            updates[key] = tuple(value)
+        elif key == "commands":
+            if not isinstance(value, list):
+                raise ConfigError("`commands` must be a list of tables")
             updates[key] = tuple(value)
         else:
             unknown.append(key)
