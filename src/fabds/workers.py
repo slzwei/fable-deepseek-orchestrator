@@ -439,20 +439,8 @@ class WorkerRunner:
                     envelope.error = exc.as_dict()
                 continue
 
-            observations: list[str] = []
-            finished = False
-            for action in actions:
-                if action.kind is ActionKind.FINISH:
-                    finish_payload = action.payload
-                    finished = True
-                    break
-                result = executor.execute(action)
-                observations.append(result.render())
-                self.logger.debug(
-                    f"worker:{self.packet.task_id}",
-                    f"turn {turn}: {result.action} -> {'ok' if result.ok else 'refused/error'}",
-                )
-            if finished:
+            finish_payload, observations = self._apply(actions, executor, turn)
+            if finish_payload is not None:
                 break
 
             remaining = self.max_turns - turn
@@ -467,6 +455,25 @@ class WorkerRunner:
 
         self._finalise(envelope, executor, finish_payload, started)
         return envelope
+
+    def _apply(self, actions, executor: ActionExecutor, turn: int):
+        """Execute one turn's actions, stopping at a finish.
+
+        Returns ``(finish_payload_or_None, observations)``. Refusals are
+        observations too: the worker is told exactly why, so it can adjust
+        rather than repeat the same denied action.
+        """
+        observations: list[str] = []
+        for action in actions:
+            if action.kind is ActionKind.FINISH:
+                return action.payload, observations
+            result = executor.execute(action)
+            observations.append(result.render())
+            self.logger.debug(
+                f"worker:{self.packet.task_id}",
+                f"turn {turn}: {result.action} -> {'ok' if result.ok else 'refused/error'}",
+            )
+        return None, observations
 
     def _complete(self, prompt: str, turn: int, attempts: int):
         """One provider call with bounded retries and attestation."""

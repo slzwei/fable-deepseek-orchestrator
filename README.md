@@ -10,9 +10,9 @@ A Codex skill that puts three models in their right places:
 - **Codex/Astra** stays in charge. It authorises what workers may do, verifies
   results against its own evidence, and decides what gets integrated.
 
-Roughly 3,600 lines of Python, standard library only, no daemon, no
-auto-update, and a test suite that proves the security properties rather than
-asserting them.
+About 7,000 lines of Python across 27 modules, standard library only, no
+daemon, no auto-update, and a 366-test suite that proves the security
+properties rather than asserting them.
 
 ```
 you
@@ -92,8 +92,12 @@ $SKILL/scripts/orchestrate resolve                 # which models, with evidence
 $SKILL/scripts/orchestrate run "<task>" --dry-run  # call nothing, change nothing
 $SKILL/scripts/orchestrate run "Add retry with backoff to the HTTP client" \
     --constraints "no new dependencies" --focus src/http/client.py
-$SKILL/scripts/orchestrate integrate w01 w03       # apply what you accepted
+$SKILL/scripts/orchestrate integrate w01 w03 --verify   # apply, then check the result
+$SKILL/scripts/orchestrate verify                      # check the working tree
 ```
+
+Common flags (`-C`, `-v`, `-q`, `--json`, `--no-cache`) work before or after the
+subcommand.
 
 `resolve` shows the resolution and the evidence behind it:
 
@@ -127,7 +131,14 @@ installed CLI's own embedded model table, the DeepSeek ids come from its
    reports, failing validation, repeated failed fixes, several workers hitting
    permission boundaries. Otherwise the controller continues alone.
 7. Results are written to `.fabds/runs/<run_id>/` as packets, envelopes and
-   patches. **Nothing is merged.** You run `integrate` on what you accept.
+   patches. **Nothing is merged.** You run `integrate` on what you accept, then
+   `verify` the merged tree — per-packet checks run in isolated worktrees and
+   cannot see each other, so they are necessary but never sufficient.
+
+If Fable is unavailable, the run fails closed rather than substituting. You can
+still use the swarm: write the decomposition yourself and pass
+`--packets FILE --no-planner`. Those packets go through the same controller
+authorisation as a planner's, so nothing about the security model changes.
 
 ### Configuration
 

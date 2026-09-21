@@ -28,14 +28,7 @@ from . import __version__
 from .cache import FileCache
 from .config import Config
 from .context import ContextBuilder, ContextPacket, git_state, repo_identity
-from .errors import (
-    ConfigError,
-    FabdsError,
-    LimitExceeded,
-    ModelResolutionError,
-    PermissionDeniedError,
-    WorkspaceError,
-)
+from .errors import ConfigError, FabdsError, LimitExceeded, ModelResolutionError
 from .ledger import RunLedger, new_run_id
 from .logging import Level, RunLogger
 from .models import ModelResolver, ResolvedModel, Role
@@ -61,6 +54,29 @@ def _module_available(module: str) -> bool:
     return run_command(["python3", "-c", f"import {module}"], timeout_s=60).ok
 
 
+def _tests_dir(root: Path) -> str | None:
+    return next((d for d in ("tests", "test") if (root / d).is_dir()), None)
+
+
+def _has_unittest_tests(root: Path) -> bool:
+    """Are the tests written against unittest, rather than bare pytest functions?
+
+    ``unittest discover`` cannot collect a bare ``def test_x()``, so offering it
+    for a pytest-style suite produces a command that runs zero tests and exits
+    non-zero, which reads like a broken build rather than a missing runner.
+    """
+    directory = _tests_dir(root)
+    candidates = sorted((root / directory).rglob("test*.py")) if directory else []
+    candidates += sorted(root.glob("test*.py"))
+    for path in candidates[:50]:
+        try:
+            if "unittest" in path.read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def detect_validation_commands(repo_root: Path) -> list[CommandSpec]:
     """Infer a small, safe validation allowlist from repository conventions.
 
@@ -78,13 +94,14 @@ def detect_validation_commands(repo_root: Path) -> list[CommandSpec]:
                 "pytest", ("python3", "-m", "pytest", "-q"),
                 "run the Python test suite", timeout_s=900, max_extra_paths=1,
             ))
-        else:
+        elif _has_unittest_tests(root):
             # pytest is not importable here, so offering it would guarantee a
-            # confusing failure. unittest is always present - but plain
-            # `discover` silently finds nothing when tests/ is not an importable
-            # package, which is the common layout. Point it at the directory and
-            # make that directory the import root.
-            tests_dir = next((d for d in ("tests", "test") if (root / d).is_dir()), None)
+            # confusing failure. unittest is present everywhere - but only helps
+            # if the tests are written for it, and plain `discover` silently
+            # finds nothing when tests/ is not an importable package, which is
+            # the common layout. Point it at the directory and make that
+            # directory the import root.
+            tests_dir = _tests_dir(root)
             if tests_dir and not (root / tests_dir / "__init__.py").exists():
                 argv = ("python3", "-m", "unittest", "discover",
                         "-s", tests_dir, "-t", tests_dir)
@@ -93,6 +110,9 @@ def detect_validation_commands(repo_root: Path) -> list[CommandSpec]:
             specs.append(CommandSpec(
                 "unittest", argv, "run the standard-library test suite", timeout_s=900,
             ))
+        # If neither runner can work here, offer neither. A command that
+        # discovers nothing and exits non-zero is worse than an honest gap:
+        # `verify` says plainly that nothing was verified.
         specs.append(CommandSpec(
             "py_compile", ("python3", "-m", "compileall", "-q", "."),
             "byte-compile the tree to catch syntax errors", timeout_s=300,
@@ -523,48 +543,70 @@ class Orchestrator:
                 self.ledger.save_result(envelope)
             outcome.verification = getattr(self, "_verification", {})
 
-            decision = should_escalate(
-                results=results, plan=plan,
-                rounds_used=planner.rounds_used,
-                max_rounds=self.config.limits.max_planner_rounds,
-                repeated_failures=sum(1 for e in results.values()
-                                      if e.status is TaskStatus.FAILED),
-                final_review_requested=final_review,
+            outcome.critique = self._maybe_critique(
+                planner, plan, results, outcome.verification,
+                use_planner=use_planner and packets_file is None,
+                final_review=final_review,
             )
-            if decision.escalate and use_planner:
-                self.logger.info("critic", f"escalating: {decision.reason}")
-                critique = planner.critique(
-                    material=self._critique_material(plan, results, outcome.verification),
-                    question=decision.reason,
-                )
-                outcome.critique = critique.as_dict()
-                self.ledger.write_json("critique.json", critique.as_dict())
-            else:
-                self.logger.info("critic", f"review skipped: {decision.reason}")
-                outcome.critique = {"skipped": True, "reason": decision.reason}
-
-            succeeded = [e for e in results.values() if e.succeeded]
-            outcome.ok = bool(succeeded) and len(succeeded) == len(results)
-            outcome.stats = {
-                "planner": planner.stats(),
-                "workers": {
-                    "total": len(results),
-                    "completed": len(succeeded),
-                    "failed": sum(1 for e in results.values() if e.status is TaskStatus.FAILED),
-                    "blocked": sum(1 for e in results.values() if e.status is TaskStatus.BLOCKED),
-                    "skipped": sum(1 for e in results.values() if e.status is TaskStatus.SKIPPED),
-                    "denied_actions": sum(len(e.denied_actions) for e in results.values()),
-                },
-                "cache": self.cache.stats(),
-                "context": context.summary(),
-                "wall_clock_s": round(time.monotonic() - self._started, 2),
-            }
+            outcome.ok = self._all_succeeded(results)
+            outcome.stats = self._stats(planner, results, context)
         except FabdsError as exc:
             self.logger.error("controller", f"{exc.code}: {exc.message}")
             outcome.error = exc.as_dict()
         finally:
             self.ledger.save_manifest(outcome.as_dict())
         return outcome
+
+    def _maybe_critique(self, planner: Planner, plan: Plan, results: dict,
+                        verification: dict, *, use_planner: bool,
+                        final_review: bool) -> dict:
+        """Escalate to the critic only on a named trigger. Default: do not."""
+        decision = should_escalate(
+            results=results, plan=plan,
+            rounds_used=planner.rounds_used,
+            max_rounds=self.config.limits.max_planner_rounds,
+            repeated_failures=sum(1 for e in results.values()
+                                  if e.status is TaskStatus.FAILED),
+            final_review_requested=final_review,
+        )
+        if not (decision.escalate and use_planner):
+            self.logger.info("critic", f"review skipped: {decision.reason}")
+            return {"skipped": True, "reason": decision.reason}
+
+        self.logger.info("critic", f"escalating: {decision.reason}")
+        try:
+            critique = planner.critique(
+                material=self._critique_material(plan, results, verification),
+                question=decision.reason,
+            )
+        except FabdsError as exc:
+            # A failed critique must not discard work that already succeeded.
+            self.logger.warn("critic", f"review unavailable: {exc.message}")
+            return {"skipped": True, "reason": f"review unavailable: {exc.code}",
+                    "error": exc.as_dict()}
+        self.ledger.write_json("critique.json", critique.as_dict())
+        return critique.as_dict()
+
+    @staticmethod
+    def _all_succeeded(results: dict) -> bool:
+        succeeded = [e for e in results.values() if e.succeeded]
+        return bool(succeeded) and len(succeeded) == len(results)
+
+    def _stats(self, planner: Planner, results: dict, context: ContextPacket) -> dict:
+        return {
+            "planner": planner.stats(),
+            "workers": {
+                "total": len(results),
+                "completed": sum(1 for e in results.values() if e.succeeded),
+                "failed": sum(1 for e in results.values() if e.status is TaskStatus.FAILED),
+                "blocked": sum(1 for e in results.values() if e.status is TaskStatus.BLOCKED),
+                "skipped": sum(1 for e in results.values() if e.status is TaskStatus.SKIPPED),
+                "denied_actions": sum(len(e.denied_actions) for e in results.values()),
+            },
+            "cache": self.cache.stats(),
+            "context": context.summary(),
+            "wall_clock_s": round(time.monotonic() - self._started, 2),
+        }
 
     def _fallback_plan(self, task: str) -> Plan:
         """The controller's own single-packet decomposition.

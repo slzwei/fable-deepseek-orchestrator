@@ -55,13 +55,39 @@ $SKILL/scripts/orchestrate resolve            # which models, and the evidence
 $SKILL/scripts/orchestrate run "<task>" --dry-run
 $SKILL/scripts/orchestrate run "<task>" --constraints "..." --focus src/api.py
 $SKILL/scripts/orchestrate plan "<task>"      # one planning round, no workers
-$SKILL/scripts/orchestrate integrate w01 w03  # apply the patches you accepted
+$SKILL/scripts/orchestrate integrate w01 w03 --verify
+$SKILL/scripts/orchestrate verify             # check the integrated working tree
 $SKILL/scripts/orchestrate runs               # previous runs in this repository
 ```
 
 Useful flags: `-C PATH` (target repository), `--max-workers N`, `--max-tasks N`,
-`--no-planner` (skip Fable and decompose yourself), `--final-review` (force a
-closing critique), `--no-cache`, `-v`/`-q`, `--json`.
+`--no-planner` (skip Fable and decompose yourself), `--packets FILE` (supply
+your own decomposition), `--final-review` (force a closing critique),
+`--no-cache`, `-v`/`-q`, `--json`. Common flags work before or after the
+subcommand.
+
+### When Fable is unavailable
+
+If the planner is rate limited or out of quota, the run fails closed rather than
+substituting another model. You are not stuck: decompose the work yourself and
+pass it in.
+
+```bash
+cat > /tmp/packets.json <<'JSON'
+{"packets": [
+  {"task_id": "impl", "kind": "implement", "objective": "...",
+   "owned_paths": ["src/parser/**"], "readonly_paths": ["tests/**"],
+   "acceptance_criteria": ["pytest tests/parser passes"]},
+  {"task_id": "tests", "kind": "test", "objective": "...",
+   "owned_paths": ["tests/parser/**"], "readonly_paths": ["src/**"],
+   "acceptance_criteria": ["the new tests fail against the old behaviour"]}
+]}
+JSON
+$SKILL/scripts/orchestrate run "<task>" --packets /tmp/packets.json --no-planner
+```
+
+The packets still go through controller authorisation, so commands, path grants
+and the read-only rule are applied exactly as they would be for a Fable plan.
 
 ## How to run one
 
@@ -94,8 +120,13 @@ For each packet in `.fabds/runs/<run_id>/`:
 to see whether the patches still apply. Patches you do not name are not applied.
 Resolve conflicts between packets yourself; that judgement is yours.
 
-**6. Verify the integrated result.** Isolated packets passing does not mean the
-merged tree works. Re-run the suite after integrating.
+**6. Verify the integrated result.** `integrate --verify`, or `verify` on its
+own. This step is not optional bookkeeping. Packets are verified in isolation,
+and isolation cannot catch everything: a test packet written in one worktree
+physically cannot see an implementation written in another, so its per-packet
+check will fail even when both halves are correct. Two patches that each apply
+cleanly can also still be wrong together. The integrated check is the one that
+decides whether the task is done.
 
 ## Writing good packets
 

@@ -48,7 +48,6 @@ def _common_flags(*, suppress_defaults: bool) -> argparse.ArgumentParser:
     was actually typed, so both positions work and the last one wins.
     """
     common = argparse.ArgumentParser(add_help=False)
-    default = argparse.SUPPRESS if suppress_defaults else None
 
     def add(*names, **kwargs):
         if suppress_defaults:
@@ -230,7 +229,7 @@ def _run_common(args, *, plan_only: bool) -> int:
 def _plan_only(orchestrator, args):
     """One planning round with no workers and no file changes."""
     from .models import Role as _Role
-    from .orchestrator import RunOutcome, detect_validation_commands
+    from .orchestrator import RunOutcome
     from .planner import Planner
     from .providers import get_provider
     from .context import git_state, repo_identity

@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from fabds import __version__                                    # noqa: E402
 from fabds.config import load_config                             # noqa: E402
 from fabds.logging import Level, RunLogger                       # noqa: E402
-from fabds.models import ModelResolver, ResolvedModel, Role      # noqa: E402
+from fabds.models import ResolvedModel, Role                     # noqa: E402
 from fabds.orchestrator import Orchestrator, detect_validation_commands  # noqa: E402
 from fabds.packets import TaskKind                               # noqa: E402
 from fabds.planner import Plan, PlannedPacket                    # noqa: E402

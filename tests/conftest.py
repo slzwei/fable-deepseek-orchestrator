@@ -104,8 +104,18 @@ def git_repo(tmp_path) -> Path:
     (root / "src").mkdir(parents=True)
     (root / "tests").mkdir()
     (root / "src" / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    # unittest.TestCase so the suite is collectable by pytest *and* by
+    # `unittest discover`; the fixture must not assume pytest is installed for
+    # the interpreter a worker command would use.
     (root / "tests" / "test_calc.py").write_text(
-        "from src.calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+        "import sys\n"
+        "import unittest\n"
+        "from pathlib import Path\n\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n\n"
+        "from src.calc import add\n\n\n"
+        "class TestAdd(unittest.TestCase):\n"
+        "    def test_add(self):\n"
+        "        self.assertEqual(add(1, 2), 3)\n",
         encoding="utf-8",
     )
     (root / "README.md").write_text("# demo\n", encoding="utf-8")
