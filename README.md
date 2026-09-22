@@ -148,7 +148,7 @@ authorisation as a planner's, so nothing about the security model changes.
 `~/.config/fabds/config.toml`, overridden per repository by `.fabds/config.toml`:
 
 ```toml
-deepseek_api_key_file = "~/quantlab/ds-api-key"
+deepseek_api_key_file = "~/.config/fabds/deepseek-api-key"
 plan_cache_ttl_s = 21600
 
 [limits]
