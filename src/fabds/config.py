@@ -108,6 +108,23 @@ class Config:
     analysis_cache_ttl_s: int = 24 * 3600
     cache_enabled: bool = True
 
+    #: Off-peak scheduling. DeepSeek charges half rate outside its peak windows
+    #: (01:00-04:00 and 06:00-10:00 UTC on working weekdays), so a run can be
+    #: made to wait. Off by default: waiting is a cost/latency trade the
+    #: operator opts into, never a surprise.
+    deepseek_offpeak_only: bool = False
+    #: Explicit override. When true, peak-time calls proceed and are logged as
+    #: full price. Set by --peak-ok. Wins over deepseek_offpeak_only.
+    deepseek_allow_peak: bool = False
+    #: Longest a single call will block waiting for the window to open.
+    #: Peak windows are at most four hours, so this bounds a real wait with room
+    #: to spare; exceeding it raises rather than silently paying peak rates.
+    deepseek_offpeak_max_wait_s: int = 5 * 3600
+    #: Chinese public holidays (YYYY-MM-DD). These are off-peak in full, but
+    #: fabds ships no holiday calendar and will not guess one, so listing them
+    #: here is what turns a holiday from "assumed working day" into off-peak.
+    offpeak_extra_dates: tuple[str, ...] = ()
+
     #: Provider endpoints and credentials (paths, never values)
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key_file: Path | None = None
@@ -156,6 +173,14 @@ class Config:
                 "allow_model_fallback is on but no fallback ids were configured; "
                 "fabds refuses to pick a substitute model for you"
             )
+        if self.deepseek_offpeak_max_wait_s < 0:
+            raise ConfigError("deepseek_offpeak_max_wait_s must not be negative")
+        try:
+            from .pricing import parse_holidays
+
+            parse_holidays(self.offpeak_extra_dates)
+        except ValueError as exc:
+            raise ConfigError(f"offpeak_extra_dates must be YYYY-MM-DD: {exc}") from exc
         if not self.deepseek_base_url.startswith("https://"):
             raise ConfigError(
                 f"deepseek_base_url must be https, got {self.deepseek_base_url!r}"
@@ -189,6 +214,7 @@ def _config_candidates(repo_root: Path | None) -> list[Path]:
 _SCALAR_FIELDS = {
     "cache_enabled", "plan_cache_ttl_s", "analysis_cache_ttl_s",
     "deepseek_base_url", "claude_cli",
+    "deepseek_offpeak_only", "deepseek_allow_peak", "deepseek_offpeak_max_wait_s",
 }
 
 
@@ -266,7 +292,7 @@ def _apply(config: Config, data: dict, source: Path) -> Config:
             updates[key] = Path(str(value)).expanduser()
         elif key == "deepseek_api_key_file":
             updates[key] = Path(str(value)).expanduser()
-        elif key in ("extra_secret_paths", "context_allowlist"):
+        elif key in ("extra_secret_paths", "context_allowlist", "offpeak_extra_dates"):
             updates[key] = tuple(value)
         elif key == "commands":
             if not isinstance(value, list):

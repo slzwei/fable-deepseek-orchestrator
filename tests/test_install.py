@@ -140,6 +140,7 @@ def test_only_the_deepseek_endpoint_is_ever_contacted():
         hosts |= set(re.findall(r"https?://([a-zA-Z0-9._-]+)", text))
     allowed = {
         "api.deepseek.com",        # the only endpoint fabds actually calls
+        "api-docs.deepseek.com",   # a documentation link in a pricing comment
         "hooks.slack.com",         # appears only inside a redaction pattern
         "attacker.invalid",        # appears only in a docstring about proxies
     }

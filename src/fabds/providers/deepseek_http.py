@@ -23,12 +23,14 @@ import json
 import random
 import ssl
 import time
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from ..errors import (
     ContextTooLarge,
+    PeakHoursBlocked,
     EmptyResponse,
     MalformedResponse,
     ModelAttestationError,
@@ -38,6 +40,7 @@ from ..errors import (
     ProviderUnavailable,
     ResponseTruncated,
 )
+from ..pricing import describe, parse_holidays, status
 from ..redaction import REDACTOR
 from .base import CompletionRequest, DiscoveredModel, ModelResponse, ProviderStatus
 
@@ -45,6 +48,11 @@ __all__ = ["DeepSeekHttpProvider"]
 
 _USER_AGENT = "fabds/orchestrator (+stdlib urllib)"
 _RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+#: Wait-loop slice bounds. Short enough to notice a clock change, long
+#: enough not to busy-spin through a multi-hour window.
+_MIN_SLICE_S = 1.0
+_MAX_SLICE_S = 60.0
 
 
 def _no_proxy_opener() -> urllib.request.OpenerDirector:
@@ -71,11 +79,95 @@ class DeepSeekHttpProvider:
 
     name = "deepseek_http"
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, sleep=time.sleep, clock=None) -> None:
         self.config = config
         self.base_url = config.deepseek_base_url.rstrip("/")
         self.key_file = Path(config.deepseek_api_key_file) if config.deepseek_api_key_file else None
         self._opener = _no_proxy_opener()
+        self._sleep = sleep
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._holidays = parse_holidays(getattr(config, "offpeak_extra_dates", ()))
+        #: Set by the orchestrator so waits are visible rather than silent.
+        self.on_wait = None
+
+    # -- off-peak gate ------------------------------------------------------
+
+    def _await_offpeak(self) -> None:
+        """Block until the request would be billed off-peak.
+
+        The gate lives here, at the transport boundary, rather than in the
+        orchestrator. That is deliberate: the guarantee the operator asked for
+        is that the prompt does not go out at peak rates, and a check in the
+        orchestrator only holds for callers who go through the orchestrator. A
+        library caller, a test, or a future code path would bypass it. Nothing
+        reaches DeepSeek without passing this function.
+        """
+        if not getattr(self.config, "deepseek_offpeak_only", False):
+            return
+        if getattr(self.config, "deepseek_allow_peak", False):
+            return  # explicit operator override; logged by the caller
+
+        state = status(self._clock(), holidays=self._holidays)
+        if not state.peak:
+            return
+
+        limit = getattr(self.config, "deepseek_offpeak_max_wait_s", 5 * 3600)
+        if state.wait_seconds > limit:
+            raise PeakHoursBlocked(
+                f"DeepSeek is in a peak window until {state.next_offpeak:%H:%M}Z "
+                f"({state.wait_seconds / 3600:.1f}h away), which exceeds the "
+                f"{limit / 3600:.1f}h wait limit. Raise "
+                f"deepseek_offpeak_max_wait_s, or pass --peak-ok to accept "
+                f"full-rate billing.",
+                detail=state.as_dict(),
+            )
+
+        if self.on_wait is not None:
+            self.on_wait(state)
+
+        # Sleep in short slices, re-evaluating the window each time, so a clock
+        # adjustment during the wait is noticed rather than ignored.
+        #
+        # Termination is guaranteed by three independent bounds, because any one
+        # of them alone can be defeated:
+        #
+        #   * the window itself - the normal exit;
+        #   * real elapsed time, from a monotonic clock, so a wall clock that is
+        #     frozen or stepped backwards cannot strand the loop;
+        #   * an iteration cap, so even a no-op sleep (a test double, a stubbed
+        #     scheduler) still terminates.
+        #
+        # Spinning forever would be a worse failure than paying peak rates,
+        # because it is silent. All three paths raise instead.
+        # Wait until the *margin-adjusted* target, not merely until is_peak()
+        # flips. Exiting the instant the window closes means firing a request at
+        # exactly 04:00:00, and how the server classifies that on arrival is not
+        # ours to decide. The margin is the whole point of computing a target.
+        target = state.next_offpeak
+        started_monotonic = time.monotonic()
+        max_iterations = int(limit // _MIN_SLICE_S) + 60
+        iterations = 0
+
+        while True:
+            now = self._clock()
+            state = status(now, holidays=self._holidays)
+            if not state.peak and now >= target:
+                return
+
+            iterations += 1
+            elapsed = time.monotonic() - started_monotonic
+            if elapsed > limit or iterations > max_iterations:
+                raise PeakHoursBlocked(
+                    f"gave up waiting for an off-peak window after "
+                    f"{elapsed / 3600:.1f}h of real time and {iterations} checks; "
+                    f"it is still peak at {now:%H:%M}Z. Either the clock is not "
+                    f"advancing or the window never opened. Pass --peak-ok to "
+                    f"proceed at full rate.",
+                    detail=state.as_dict(),
+                )
+
+            remaining = max(state.wait_seconds, (target - now).total_seconds())
+            self._sleep(max(_MIN_SLICE_S, min(_MAX_SLICE_S, remaining)))
 
     # -- credentials --------------------------------------------------------
 
@@ -106,10 +198,15 @@ class DeepSeekHttpProvider:
             return ProviderStatus(self.name, False, detail=f"key file missing: {self.key_file}")
         mode = self.key_file.stat().st_mode & 0o777
         warning = "" if mode & 0o077 == 0 else f" (warning: key file mode {mode:o} is group/world readable)"
+        gate = ""
+        if getattr(self.config, "deepseek_offpeak_only", False):
+            gate = (" | off-peak gate: OVERRIDDEN (--peak-ok)"
+                    if getattr(self.config, "deepseek_allow_peak", False)
+                    else f" | off-peak gate on: {describe(holidays=self._holidays)}")
         return ProviderStatus(
             self.name,
             True,
-            detail=f"{self.base_url}, key file {self.key_file}{warning}",
+            detail=f"{self.base_url}, key file {self.key_file}{warning}{gate}",
             isolation="direct HTTPS: no shell, no filesystem, no MCP surface; "
                       "proxies from the environment are ignored",
         )
@@ -135,6 +232,7 @@ class DeepSeekHttpProvider:
     # -- invocation ---------------------------------------------------------
 
     def complete(self, request: CompletionRequest) -> ModelResponse:
+        self._await_offpeak()
         thinking = request.reasoning_effort not in ("none", "off")
         body = {
             "model": request.model_id,

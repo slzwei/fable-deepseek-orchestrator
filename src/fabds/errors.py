@@ -97,3 +97,9 @@ class LimitExceeded(FabdsError):
 
 class WorkspaceError(FabdsError):
     code = "workspace_error"
+
+
+class PeakHoursBlocked(FabdsError):
+    """A call was refused because it would have been billed at peak rates."""
+
+    code = "peak_hours_blocked"

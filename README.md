@@ -143,6 +143,42 @@ still use the swarm: write the decomposition yourself and pass
 `--packets FILE --no-planner`. Those packets go through the same controller
 authorisation as a planner's, so nothing about the security model changes.
 
+### Paying half price
+
+DeepSeek bills peak and off-peak differently, and off-peak is **half rate**:
+
+| | UTC |
+|---|---|
+| Peak | 01:00–04:00 and 06:00–10:00, Mon–Fri, excluding Chinese public holidays |
+| Off-peak | everything else, including weekends and holidays in full |
+
+Peak is the *narrow* window, so waiting costs at most about four hours, never
+overnight. `--offpeak` makes every worker call wait for it:
+
+```bash
+fabds run "<task>" --offpeak            # wait for half rate
+fabds run "<task>" --offpeak --peak-ok  # armed in config, but go now anyway
+fabds doctor                            # shows the current window
+fabds run "<task>" --dry-run --offpeak  # shows exactly how long it would hold
+```
+
+The gate sits in the DeepSeek provider, not the orchestrator, so a library
+caller cannot bypass it. It is off by default — waiting is a trade you opt into.
+When armed it is bounded three ways (the window, real elapsed time, and an
+iteration cap) and raises `PeakHoursBlocked` rather than hanging or silently
+paying peak rates.
+
+fabds ships **no Chinese public holiday calendar and will not guess one**. An
+undeclared holiday is treated as a working day, so the error is always toward
+waiting unnecessarily rather than overspending. Declare them to get the
+discount:
+
+```toml
+deepseek_offpeak_only = true
+deepseek_offpeak_max_wait_s = 18000
+offpeak_extra_dates = ["2026-10-01", "2026-10-02"]
+```
+
 ### Configuration
 
 `~/.config/fabds/config.toml`, overridden per repository by `.fabds/config.toml`:

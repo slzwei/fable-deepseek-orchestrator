@@ -1,0 +1,31 @@
+# GitGuardian configuration.
+#
+# This repository is a credential-handling tool, so it necessarily contains
+# text that looks like credentials to a scanner. Two categories exist, and they
+# are handled differently:
+#
+# 1. Test fixtures. These are all assembled at runtime from parts (see
+#    tests/test_secret_redaction.py::_synth) specifically so that no key-shaped
+#    literal ever appears on disk. Nothing is ignored here for them, because
+#    there is nothing left to ignore.
+#
+# 2. The credential-path denylist in src/fabds/sanitizer.py. This is the list of
+#    filenames the orchestrator refuses to read - ".password-store", "*password*",
+#    ".htpasswd" and so on. A tool that excludes password stores cannot be
+#    written without the word "password" in it, so these are declared here as
+#    what they are: pattern strings, not secrets.
+#
+# No live credential has ever been committed to this repository. The DeepSeek
+# API key is read from a file path given in configuration and is registered with
+# the redactor the moment it is read; see SECURITY.md.
+
+version: 2
+
+secret:
+  ignored-paths:
+    - "tests/**"          # fixtures only; see note 1 above
+  ignored-matches:
+    - name: "sanitizer credential-path denylist (pattern strings, not secrets)"
+      match: "src/fabds/sanitizer.py"
+    - name: "permissions forbidden-path list (pattern strings, not secrets)"
+      match: "src/fabds/permissions.py"

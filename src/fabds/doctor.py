@@ -87,6 +87,7 @@ def run_doctor(config: Config, repo_root: Path, *, quick: bool = False) -> Docto
     resolver = ModelResolver(config)
     _check_models(report, resolver)
     _check_cache(report, config)
+    _check_offpeak(report, config)
     _check_workspaces(report, repo_root)
     _check_worker_sandbox(report)
     if quick:
@@ -164,6 +165,20 @@ def _check_cache(report: DoctorReport, config: Config) -> None:
         report.add("Cache directory", PASS, str(cache_dir))
     except OSError as exc:
         report.add("Cache directory", FAIL, f"{cache_dir} is not writable: {exc}")
+
+
+def _check_offpeak(report: DoctorReport, config: Config) -> None:
+    """Report the DeepSeek billing window and whether the gate is armed."""
+    from .pricing import describe, parse_holidays
+
+    holidays = parse_holidays(getattr(config, "offpeak_extra_dates", ()))
+    window = describe(holidays=holidays)
+    if not getattr(config, "deepseek_offpeak_only", False):
+        report.add("DeepSeek billing window", PASS, f"{window}; gate off (--offpeak to arm)")
+    elif getattr(config, "deepseek_allow_peak", False):
+        report.add("DeepSeek billing window", WARN, f"{window}; gate OVERRIDDEN by --peak-ok")
+    else:
+        report.add("DeepSeek billing window", PASS, f"{window}; gate armed")
 
 
 def _check_workspaces(report: DoctorReport, repo_root: Path) -> None:

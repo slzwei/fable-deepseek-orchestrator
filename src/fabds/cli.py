@@ -99,6 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--max-tasks", type=int, default=None)
         command.add_argument("--base-rev", default="HEAD",
                              help="revision each worker workspace starts from")
+        command.add_argument("--offpeak", action="store_true",
+                             help="wait for DeepSeek's off-peak window before any "
+                                  "worker call (half price; peak is 01:00-04:00 and "
+                                  "06:00-10:00 UTC on working weekdays)")
+        command.add_argument("--peak-ok", action="store_true",
+                             help="override the off-peak gate and run now at full "
+                                  "rate, even if it is configured on")
         command.add_argument("--packets", default=None, metavar="FILE",
                              help="a JSON decomposition you wrote yourself, instead of "
                                   "calling the planner (same schema the planner emits)")
@@ -141,6 +148,11 @@ def _config(args):
     overrides: dict = {}
     if getattr(args, "no_cache", False):
         overrides["cache_enabled"] = False
+    if getattr(args, "offpeak", False):
+        overrides["deepseek_offpeak_only"] = True
+    if getattr(args, "peak_ok", False):
+        # An explicit override always wins, including over the config file.
+        overrides["deepseek_allow_peak"] = True
     limits = {}
     if getattr(args, "max_workers", None):
         limits["max_workers"] = args.max_workers

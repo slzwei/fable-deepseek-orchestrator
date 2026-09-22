@@ -44,6 +44,20 @@ from .workspace import create_workspace, supports_worktrees
 __all__ = ["Orchestrator", "RunOutcome", "detect_validation_commands"]
 
 
+def _offpeak_summary(config) -> dict:
+    """What the off-peak gate would do right now, for --dry-run and the ledger."""
+    from .pricing import parse_holidays, status
+
+    if not getattr(config, "deepseek_offpeak_only", False):
+        return {"enabled": False,
+                "note": "workers run immediately; pass --offpeak to wait for half rate"}
+    if getattr(config, "deepseek_allow_peak", False):
+        return {"enabled": True, "overridden": True,
+                "note": "--peak-ok is set: workers run now at full rate"}
+    state = status(holidays=parse_holidays(getattr(config, "offpeak_extra_dates", ())))
+    return {"enabled": True, "overridden": False, **state.as_dict()}
+
+
 @lru_cache(maxsize=8)
 def _module_available(module: str) -> bool:
     """Is ``module`` importable by the interpreter a worker command would use?
@@ -204,8 +218,17 @@ class _PacketJob:
                 allowlist=config.context_allowlist,
                 max_file_chars=config.limits.max_file_excerpt_chars,
             )
+            provider = self.get_provider(self.worker_model.provider, config)
+            # Make a price-driven wait visible instead of looking like a hang.
+            if hasattr(provider, "on_wait"):
+                provider.on_wait = lambda state, task=packet.task_id: (
+                    orchestrator.logger.info(
+                        f"worker:{task}",
+                        f"holding for DeepSeek off-peak: resumes "
+                        f"{state.next_offpeak:%H:%M}Z in "
+                        f"{state.wait_seconds / 3600:.1f}h (half rate)"))
             envelope = WorkerRunner(
-                provider=self.get_provider(self.worker_model.provider, config),
+                provider=provider,
                 model=self.worker_model,
                 packet=packet,
                 workspace=workspace,
@@ -766,6 +789,7 @@ class Orchestrator:
             },
             "context": context.summary(),
             "commands_offered": [c.as_dict() for c in commands],
+            "deepseek_offpeak": _offpeak_summary(self.config),
             "workspace_strategy": (
                 "git worktree per writing worker"
                 if supports_worktrees(self.repo_root) else

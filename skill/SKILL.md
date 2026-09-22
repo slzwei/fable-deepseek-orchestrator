@@ -169,6 +169,12 @@ Enforced, not merely requested:
 
 ## Cost discipline
 
+DeepSeek is half price outside 01:00–04:00 and 06:00–10:00 UTC on working
+weekdays. `--offpeak` holds every worker call until then; worst case is about
+four hours. `--peak-ok` overrides it. Use `--offpeak` for work that is not
+urgent, and say so when you do, because the run will appear to pause.
+
+
 Fable is expensive; DeepSeek is not. Call Fable for architecture, hard debugging
 strategy, competing designs, and a closing review when the stakes justify it.
 Do not call it to read a file, rename a symbol, run a test or restate a plan.
