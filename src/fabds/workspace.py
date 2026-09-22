@@ -232,6 +232,32 @@ class GitWorktreeWorkspace(Workspace):
         self._stage()
         return _git(self.root, "diff", "--cached", "--binary", check=False)
 
+    def apply_patch(self, patch: str) -> bool:
+        """Apply a dependency's staged patch into this worktree.
+
+        A packet that depends on another must be able to see what that packet
+        produced - an audit of work it cannot observe is worthless, and a test
+        packet cannot exercise an implementation written in a different
+        worktree. Applying only *completed* dependencies keeps each workspace
+        reproducible from its base revision plus a known set of patches.
+        """
+        if not patch.strip():
+            return True
+        patch_file = self.root.parent / "incoming.patch"
+        patch_file.write_text(patch, encoding="utf-8")
+        result = subprocess.run(  # noqa: S603 - argv list, shell=False
+            ["git", "-C", str(self.root), "apply", "--whitespace=nowarn", str(patch_file)],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        patch_file.unlink(missing_ok=True)
+        if result.returncode == 0:
+            # Re-baseline: the dependency's files are context, not our changes.
+            self._baseline = self._snapshot()
+            _git(self.root, "add", "--all", check=False)
+            _git(self.root, "commit", "-q", "-m", "fabds: dependency result", check=False)
+            return True
+        return False
+
     def cleanup(self) -> None:
         try:
             _git(self.source_root, "worktree", "remove", "--force", str(self.root), check=False)
@@ -323,11 +349,24 @@ class ReadOnlyWorkspace(Workspace):
 
 def create_workspace(task_id: str, source_root: Path, *, read_only: bool,
                      base_rev: str = "HEAD", include_globs: "tuple[str, ...]" = ("**/*",),
-                     sanitizer=None, include_uncommitted: "tuple[str, ...]" = ()) -> Workspace:
-    """Pick the strongest isolation the environment supports."""
+                     sanitizer=None, include_uncommitted: "tuple[str, ...]" = (),
+                     isolate_read_only: bool = False) -> Workspace:
+    """Pick the strongest isolation the environment supports.
+
+    ``isolate_read_only`` gives a read-only packet its own worktree instead of a
+    view of the repository. That is needed whenever the packet depends on other
+    packets: their results have to be applied somewhere, and applying them to
+    the user's tree is not an option. Writes stay refused either way - that is
+    enforced by :class:`~fabds.permissions.WorkerPermissions`, not by the
+    workspace type.
+    """
     source_root = Path(source_root).resolve(strict=False)
-    if read_only:
+    if read_only and not (isolate_read_only and supports_worktrees(source_root)):
         return ReadOnlyWorkspace(task_id, source_root)
+    if read_only:
+        workspace = GitWorktreeWorkspace(task_id, source_root, base_rev=base_rev)
+        workspace.read_only = True
+        return workspace
     if supports_worktrees(source_root):
         return GitWorktreeWorkspace(
             task_id, source_root, base_rev=base_rev, include_uncommitted=include_uncommitted

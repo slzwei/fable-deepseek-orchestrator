@@ -19,6 +19,7 @@ and applies only the packets it is explicitly told to apply.
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -153,6 +154,115 @@ def detect_validation_commands(repo_root: Path) -> list[CommandSpec]:
     return specs
 
 
+class _PacketJob:
+    """One packet, from workspace creation through verification to cleanup.
+
+    Everything that must happen around a worker lives here so it happens at
+    dispatch time, under the pool's concurrency limits, and in parallel with
+    other packets: build the workspace, inherit completed dependencies, run the
+    worker, verify independently, export the patch, tear the workspace down.
+    """
+
+    def __init__(self, orchestrator: "Orchestrator", packet: WorkPacket,
+                 worker_model: ResolvedModel, base_rev: str,
+                 patches: dict, patch_lock, get_provider) -> None:
+        self.orchestrator = orchestrator
+        self.packet = packet
+        self.worker_model = worker_model
+        self.base_rev = base_rev
+        self.patches = patches
+        self.patch_lock = patch_lock
+        self.get_provider = get_provider
+
+    def run(self) -> ResultEnvelope:
+        orchestrator = self.orchestrator
+        packet = self.packet
+        config = orchestrator.config
+        workspace = create_workspace(
+            packet.task_id, orchestrator.repo_root,
+            read_only=packet.read_only, base_rev=self.base_rev,
+            include_globs=tuple(packet.owned_paths) + tuple(packet.readonly_paths) or ("**/*",),
+            sanitizer=orchestrator.sanitizer,
+            # A read-only packet with dependencies still needs somewhere to
+            # receive their results, so it gets its own worktree too.
+            isolate_read_only=bool(packet.depends_on),
+        )
+        workspace.setup()
+        try:
+            self._inherit_dependencies(workspace)
+            permissions = WorkerPermissions(
+                workspace_root=workspace.root,
+                owned=packet.owned_paths,
+                readonly=packet.readonly_paths,
+                forbidden=packet.forbidden_paths,
+                read_only=packet.read_only,
+                commands=packet.command_map(),
+            )
+            sanitizer = ContextSanitizer(
+                workspace.root,
+                extra_secret_patterns=config.extra_secret_paths,
+                allowlist=config.context_allowlist,
+                max_file_chars=config.limits.max_file_excerpt_chars,
+            )
+            envelope = WorkerRunner(
+                provider=self.get_provider(self.worker_model.provider, config),
+                model=self.worker_model,
+                packet=packet,
+                workspace=workspace,
+                permissions=permissions,
+                sanitizer=sanitizer,
+                logger=orchestrator.logger,
+                max_turns=config.limits.max_worker_turns,
+                timeout_s=config.limits.worker_timeout_s,
+                max_retries=config.limits.max_retries_per_task,
+                command_timeout_s=config.limits.command_timeout_s,
+            ).run()
+
+            if not packet.read_only:
+                orchestrator._verification[packet.task_id] = (
+                    orchestrator._independent_check(packet, workspace))
+                patch = workspace.export_patch()
+                with self.patch_lock:
+                    self.patches[packet.task_id] = patch
+                saved = orchestrator.ledger.save_patch(packet.task_id, patch)
+                if saved is not None:
+                    orchestrator.logger.detail(
+                        "controller", f"staged patch for {packet.task_id} at {saved}")
+            return envelope
+        finally:
+            workspace.cleanup()
+
+    def _inherit_dependencies(self, workspace) -> None:
+        """Apply completed dependencies' patches so this packet sees their work."""
+        if not self.packet.depends_on or not hasattr(workspace, "apply_patch"):
+            return
+        applied: list[str] = []
+        for dependency in self.packet.depends_on:
+            with self.patch_lock:
+                patch = self.patches.get(dependency)
+            if not patch:
+                continue
+            if workspace.apply_patch(patch):
+                applied.append(dependency)
+                self.orchestrator.logger.detail(
+                    f"worker:{self.packet.task_id}",
+                    f"workspace seeded with the result of {dependency}")
+            else:
+                self.orchestrator.logger.warn(
+                    f"worker:{self.packet.task_id}",
+                    f"could not apply {dependency}'s patch; proceeding without it")
+        if applied:
+            # Say so explicitly. Otherwise a worker sees a clean `git status`,
+            # concludes nothing was done, and reports a problem that is not real.
+            self.packet.notes = (self.packet.notes + "\n\n" if self.packet.notes else "") + (
+                "Your workspace has already been seeded with the completed results of: "
+                + ", ".join(applied) + ". Those changes are part of your starting state and "
+                "appear as committed history, not as uncommitted changes, so an empty "
+                "`git status` is expected and does not mean the work is missing. Inspect "
+                "the files directly."
+            )
+
+
 @dataclass
 class RunOutcome:
     run_id: str
@@ -279,10 +389,14 @@ class Orchestrator:
         packets: list[WorkPacket] = []
         known_ids = {p.task_id for p in proposals}
 
+        # Read-only means "cannot write files", not "cannot run tests". Running
+        # a validation command is a read-only act on the repository - it is
+        # controller-authored argv, it cannot modify anything the permission
+        # layer would otherwise protect, and any bytecode it drops is filtered
+        # as a generated artefact. Withholding it produces an auditor that can
+        # see a problem but never confirm it.
         for proposal in proposals:
-            granted = tuple(command_map.values()) if not proposal.kind.read_only else (
-                tuple(c for c in commands if c.id in ("git_status",))
-            )
+            granted = tuple(command_map.values())
             deps = tuple(d for d in proposal.depends_on if d in known_ids and d != proposal.task_id)
             try:
                 packet = WorkPacket(
@@ -294,12 +408,18 @@ class Orchestrator:
                     readonly_paths=proposal.readonly_paths,
                     acceptance_criteria=proposal.acceptance_criteria,
                     commands=granted,
+                    # A read-only packet may run the checks, but is not
+                    # *required* to: its job is to report, not to gate.
                     validation_command_ids=(
                         tuple(v for v in validation_ids if v in {g.id for g in granted})
                         if not proposal.kind.read_only else ()
                     ),
                     depends_on=deps,
                     max_turns=limits.max_worker_turns,
+                    # Reasoning shares the completion budget with output, so
+                    # packets that mostly emit code get room to emit it, and
+                    # packets that mostly reason get room to reason.
+                    reasoning_effort=("high" if proposal.kind.read_only else "low"),
                 )
             except FabdsError as exc:
                 self.logger.warn("controller", f"rejected packet {proposal.task_id}: {exc.message}")
@@ -314,6 +434,14 @@ class Orchestrator:
 
     def execute(self, packets: "list[WorkPacket]", worker_model: ResolvedModel,
                 *, base_rev: str = "HEAD") -> dict[str, ResultEnvelope]:
+        """Run every packet under bounded concurrency in isolated workspaces.
+
+        Workspaces are created at *dispatch* time rather than up front, so a
+        packet that depends on another can start from that dependency's result.
+        Without this an audit packet inspects a tree that does not yet contain
+        the work it was asked to audit, and a test packet cannot import the
+        implementation it was written against.
+        """
         from .providers import get_provider
 
         limits = self.config.limits
@@ -326,77 +454,23 @@ class Orchestrator:
             ),
             self.logger,
         )
-        workspaces = {}
-        jobs = []
+        patches: dict[str, str] = {}
+        patch_lock = threading.Lock()
+        self._verification = {}
 
-        for packet in packets:
-            workspace = create_workspace(
-                packet.task_id, self.repo_root,
-                read_only=packet.read_only, base_rev=base_rev,
-                include_globs=tuple(packet.owned_paths) + tuple(packet.readonly_paths) or ("**/*",),
-                sanitizer=self.sanitizer,
-            )
-            workspace.setup()
-            workspaces[packet.task_id] = workspace
-            permissions = WorkerPermissions(
-                workspace_root=workspace.root,
-                owned=packet.owned_paths,
-                readonly=packet.readonly_paths,
-                forbidden=packet.forbidden_paths,
-                read_only=packet.read_only,
-                commands=packet.command_map(),
-            )
-            sanitizer = ContextSanitizer(
-                workspace.root,
-                extra_secret_patterns=self.config.extra_secret_paths,
-                allowlist=self.config.context_allowlist,
-                max_file_chars=self.config.limits.max_file_excerpt_chars,
-            )
+        def make_job(packet: WorkPacket):
+            def job():
+                return _PacketJob(self, packet, worker_model, base_rev,
+                                  patches, patch_lock, get_provider)
+            return job
 
-            def factory(packet=packet, workspace=workspace, permissions=permissions,
-                        sanitizer=sanitizer):
-                return WorkerRunner(
-                    provider=get_provider(worker_model.provider, self.config),
-                    model=worker_model,
-                    packet=packet,
-                    workspace=workspace,
-                    permissions=permissions,
-                    sanitizer=sanitizer,
-                    logger=self.logger,
-                    max_turns=limits.max_worker_turns,
-                    timeout_s=limits.worker_timeout_s,
-                    max_retries=limits.max_retries_per_task,
-                    command_timeout_s=limits.command_timeout_s,
-                )
-
-            jobs.append((packet, factory))
-
-        try:
-            results = pool.run(jobs)
-            self.logger.info(
-                "controller",
-                f"peak concurrency {pool.peak_concurrency} (limit {limits.max_workers})",
-            )
-            for task_id, workspace in workspaces.items():
-                envelope = results.get(task_id)
-                if envelope is None:
-                    continue
-                patch = workspace.export_patch()
-                saved = self.ledger.save_patch(task_id, patch)
-                if saved is not None:
-                    self.logger.detail("controller", f"staged patch for {task_id} at {saved}")
-            return results
-        finally:
-            self._verify_and_cleanup(workspaces, packets)
-
-    def _verify_and_cleanup(self, workspaces: dict, packets: "list[WorkPacket]") -> None:
-        self._verification: dict = getattr(self, "_verification", {})
-        by_id = {p.task_id: p for p in packets}
-        for task_id, workspace in workspaces.items():
-            packet = by_id.get(task_id)
-            if packet is not None and not packet.read_only:
-                self._verification[task_id] = self._independent_check(packet, workspace)
-            workspace.cleanup()
+        jobs = [(packet, make_job(packet)) for packet in packets]
+        results = pool.run(jobs)
+        self.logger.info(
+            "controller",
+            f"peak concurrency {pool.peak_concurrency} (limit {limits.max_workers})",
+        )
+        return results
 
     def _independent_check(self, packet: WorkPacket, workspace) -> dict:
         """Run the packet's validation commands ourselves.

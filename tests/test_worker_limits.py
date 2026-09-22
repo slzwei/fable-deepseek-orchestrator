@@ -165,3 +165,73 @@ def test_search_is_bounded(tmp_path, null_logger):
     too_long = executor.execute(Action(ActionKind.SEARCH, {"pattern": "a" * 500}))
     assert too_long.ok is False
     assert "exceeds" in too_long.error
+
+
+def test_a_truncated_report_does_not_discard_completed_work(tmp_path, null_logger):
+    """The files were written and verified; losing the envelope must not lose them."""
+    from fabds.packets import repair_truncated_json
+
+    # The exact shape observed in a real run: finish cut off mid-summary.
+    cut = ('{"actions": [{"op": "finish", "summary": "Wrote tests/test_readability.py '
+           'with 32 new cases covering every README rule and a 16-item')
+    salvaged = repair_truncated_json(cut)
+    assert salvaged is not None
+    assert salvaged["actions"][0]["op"] == "finish"
+
+    responses = [
+        json.dumps({"actions": [{"op": "write_file", "path": "src/a.py",
+                                 "content": "y = 2\n"}]}),
+        cut,
+    ]
+    envelope = make_runner(tmp_path, responses, null_logger, max_turns=4).run()
+    assert envelope.status is TaskStatus.COMPLETED
+    assert "src/a.py" in envelope.observed_files_changed
+    assert any("truncated" in risk for risk in envelope.risks), (
+        "a repaired report must be flagged, not passed off as complete")
+
+
+def test_repair_never_invents_an_envelope():
+    """Salvage is a last resort for text that clearly began an object."""
+    from fabds.packets import repair_truncated_json
+
+    for junk in ("not json", "", "  ", "[1, 2", "```json", "the answer is 42"):
+        assert repair_truncated_json(junk) is None
+
+
+def test_truncation_steps_the_reasoning_budget_down(tmp_path, null_logger):
+    """DeepSeek counts reasoning against the output budget, so lower it."""
+    from fabds.errors import ResponseTruncated
+
+    provider = FakeProvider(
+        "deepseek_http",
+        raises=[ResponseTruncated("no room"), ResponseTruncated("no room"), None, None],
+        responses=[
+            json.dumps({"actions": [{"op": "write_file", "path": "src/a.py",
+                                     "content": "y = 2\n"}]}),
+            json.dumps({"actions": [{"op": "finish", "summary": "ok",
+                                     "status": "completed"}]}),
+        ],
+    )
+    runner = make_runner(tmp_path, [], null_logger, max_turns=6)
+    runner.provider = provider
+    envelope = runner.run()
+    assert envelope.status is TaskStatus.COMPLETED
+    efforts = [r.reasoning_effort for r in provider.requests]
+    assert efforts[0] == "high", "starts at the packet's effort"
+    assert efforts[1] == "low" and efforts[2] == "none", f"must step down: {efforts}"
+
+
+def test_reasoning_effort_matches_what_the_packet_kind_needs(tmp_path, config, null_logger):
+    from fabds.orchestrator import Orchestrator, detect_validation_commands
+    from fabds.planner import PlannedPacket
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    orchestrator = Orchestrator(config, repo, logger=null_logger)
+    packets = orchestrator.authorise([
+        PlannedPacket("code", TaskKind.IMPLEMENT, "write", owned_paths=("src/**",)),
+        PlannedPacket("look", TaskKind.AUDIT, "review", readonly_paths=("**",)),
+    ], commands=detect_validation_commands(repo))
+    by_id = {p.task_id: p for p in packets}
+    assert by_id["code"].reasoning_effort == "low", "code emission needs output room"
+    assert by_id["look"].reasoning_effort == "high", "analysis needs reasoning room"

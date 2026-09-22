@@ -271,6 +271,21 @@ class WorkerPermissions:
     def is_forbidden(self, rel: str) -> bool:
         return self._matches(rel, tuple(self.forbidden) + self.default_forbidden)
 
+    def _is_ancestor_of_grant(self, rel: str) -> bool:
+        """True when ``rel`` is a directory containing something we may read.
+
+        A worker granted ``src/parser/**`` must still be able to list ``.`` and
+        ``src`` to find it. Listing an ancestor reveals only names, never
+        contents, and credential paths are marked excluded in a listing rather
+        than shown - so this widens navigation without widening disclosure.
+        """
+        prefix = "" if rel == "." else rel.rstrip("/") + "/"
+        for pattern in tuple(self.owned) + tuple(self.readonly):
+            root = pattern.split("*", 1)[0]
+            if rel == "." or root.startswith(prefix):
+                return True
+        return False
+
     def may_read(self, path: os.PathLike | str) -> bool:
         try:
             rel = self._relative(path)
@@ -280,7 +295,15 @@ class WorkerPermissions:
             return False
         if not self.owned and not self.readonly:
             return True  # whole-workspace read grant
-        return self._matches(rel, self.owned) or self._matches(rel, self.readonly)
+        if self._matches(rel, self.owned) or self._matches(rel, self.readonly):
+            return True
+        # Directories on the way to a granted path are navigable.
+        try:
+            if Path(path).is_dir() and self._is_ancestor_of_grant(rel):
+                return True
+        except OSError:
+            pass
+        return False
 
     def may_write(self, path: os.PathLike | str) -> bool:
         if self.read_only:

@@ -122,11 +122,13 @@ Resolve conflicts between packets yourself; that judgement is yours.
 
 **6. Verify the integrated result.** `integrate --verify`, or `verify` on its
 own. This step is not optional bookkeeping. Packets are verified in isolation,
-and isolation cannot catch everything: a test packet written in one worktree
-physically cannot see an implementation written in another, so its per-packet
-check will fail even when both halves are correct. Two patches that each apply
-cleanly can also still be wrong together. The integrated check is the one that
-decides whether the task is done.
+and isolation cannot catch everything. A packet that declares `depends_on`
+starts from its dependencies' results, so a test packet can import the
+implementation and an auditor can inspect real work — declare those
+dependencies or the packet will be judging an empty tree. Independent packets
+still cannot see each other, and two patches that each apply cleanly can still
+be wrong together. The integrated check is the one that decides whether the
+task is done.
 
 ## Writing good packets
 

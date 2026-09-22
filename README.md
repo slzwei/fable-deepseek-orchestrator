@@ -132,8 +132,11 @@ installed CLI's own embedded model table, the DeepSeek ids come from its
    permission boundaries. Otherwise the controller continues alone.
 7. Results are written to `.fabds/runs/<run_id>/` as packets, envelopes and
    patches. **Nothing is merged.** You run `integrate` on what you accept, then
-   `verify` the merged tree — per-packet checks run in isolated worktrees and
-   cannot see each other, so they are necessary but never sufficient.
+   `verify` the merged tree. A packet that `depends_on` another starts from
+   that dependency's result, so a test packet can exercise the implementation
+   and an auditor can inspect the work it was asked to audit. Independent
+   packets still cannot see each other, so the integrated check remains
+   necessary.
 
 If Fable is unavailable, the run fails closed rather than substituting. You can
 still use the swarm: write the decomposition yourself and pass

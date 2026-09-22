@@ -273,9 +273,65 @@ def extract_json_object(text: str) -> dict:
         if isinstance(parsed, dict):
             return parsed
 
+    salvaged = repair_truncated_json(stripped)
+    if salvaged is not None:
+        salvaged["_truncated_report"] = True
+        return salvaged
+
     raise MalformedResponse(
         "model response did not contain a JSON object", detail=text[:600]
     )
+
+
+def repair_truncated_json(text: str) -> dict | None:
+    """Close an object that was cut off mid-emission.
+
+    A worker whose *report* is truncated has usually already done the work: the
+    files are written and the controller has verified them. Throwing the report
+    away and calling the packet failed loses real work over a formatting
+    accident. So a response that clearly began a JSON object gets one repair
+    attempt - terminate an open string, close open brackets - and the result is
+    flagged ``_truncated_report`` so nothing downstream mistakes it for a
+    complete envelope.
+
+    Only ever applied as a last resort, and only to text that starts with "{".
+    """
+    if not text.startswith("{"):
+        return None
+
+    in_string = escape = False
+    stack: list[str] = []
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]" and stack:
+            stack.pop()
+
+    repaired = text
+    if escape:
+        repaired = repaired[:-1]
+    if in_string:
+        repaired += '"'
+    # Drop a dangling "key": with no value, and any trailing comma.
+    repaired = re.sub(r',\s*"[^"]*"\s*:\s*$', "", repaired)
+    repaired = re.sub(r',\s*$', "", repaired)
+    repaired += "".join(reversed(stack))
+
+    try:
+        parsed = json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def parse_actions(text: str, *, max_actions: int = 8) -> list[Action]:
@@ -286,12 +342,17 @@ def parse_actions(text: str, *, max_actions: int = 8) -> list[Action]:
     action is executed.
     """
     payload = extract_json_object(text)
+    # A repaired object flags itself on the outside; carry that onto the action
+    # it produced, or the warning is lost when the envelope is assembled.
+    truncated = bool(payload.pop("_truncated_report", False))
     raw_actions = payload.get("actions")
     if raw_actions is None and "action" in payload:
         raw_actions = [payload["action"]]
     if raw_actions is None:
         # A bare result envelope is treated as an implicit finish.
         if "summary" in payload or "status" in payload:
+            if truncated:
+                payload["_truncated_report"] = True
             return [Action(ActionKind.FINISH, payload)]
         raise MalformedResponse(
             "worker response has no 'actions' list and is not a result envelope",
@@ -318,6 +379,8 @@ def parse_actions(text: str, *, max_actions: int = 8) -> list[Action]:
             ) from exc
         payload_fields = {k: v for k, v in entry.items() if k not in ("op", "action", "kind")}
         _validate_action_shape(kind, payload_fields, index)
+        if truncated:
+            payload_fields["_truncated_report"] = True
         actions.append(Action(kind, payload_fields))
     return actions
 

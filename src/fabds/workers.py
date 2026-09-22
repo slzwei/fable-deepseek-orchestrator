@@ -384,6 +384,11 @@ class WorkerRunner:
         transcript = [self._initial_prompt()]
         attempts = 1
         finish_payload: dict | None = None
+        # DeepSeek counts reasoning against the same completion budget, so a
+        # truncated reply is usually thinking crowding out output. Step the
+        # effort down before asking again; a shorter-answer hint alone does not
+        # address the cause.
+        self._effort = self.packet.reasoning_effort
 
         for turn in range(1, self.max_turns + 1):
             if time.monotonic() - started > self.timeout_s:
@@ -399,9 +404,12 @@ class WorkerRunner:
                 # The provider answered, but the answer was unusable. Spend a
                 # turn telling the model why instead of killing the worker.
                 envelope.turns_used = turn
+                downgrade = {"max": "high", "high": "low", "low": "none"}
+                self._effort = downgrade.get(self._effort, "none")
                 self.logger.warn(
                     f"worker:{self.packet.task_id}",
-                    f"turn {turn}: {exc.code}, re-prompting with a smaller-output hint",
+                    f"turn {turn}: {exc.code}, retrying with reasoning_effort="
+                    f"{self._effort} and a smaller-output hint",
                 )
                 transcript.append(
                     f"Your previous reply was unusable ({exc.message}). "
@@ -484,7 +492,7 @@ class WorkerRunner:
                 user_prompt=prompt,
                 model_id=self.model.model_id,
                 max_output_tokens=self.packet.max_output_tokens,
-                reasoning_effort=self.packet.reasoning_effort,
+                reasoning_effort=self._effort,
                 timeout_s=min(self.timeout_s, 300),
                 label=f"{self.packet.task_id}#t{turn}",
             )
@@ -536,6 +544,14 @@ class WorkerRunner:
             envelope.status = (
                 TaskStatus.BLOCKED if claimed == "blocked" else TaskStatus.COMPLETED
             )
+            if finish_payload.get("_truncated_report"):
+                # The work may be fine; the report is demonstrably incomplete.
+                # Say so, so the controller weighs it accordingly.
+                envelope.risks = envelope.risks + (
+                    "this worker's report was truncated mid-emission and had to be "
+                    "repaired; treat its self-reported fields as incomplete and rely "
+                    "on the controller's observed changes and checks",
+                )
         elif envelope.status is TaskStatus.RUNNING:
             envelope.status = TaskStatus.FAILED
 

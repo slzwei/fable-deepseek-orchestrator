@@ -28,7 +28,11 @@ reasoning, and no repository dump — only this.
 - High-contention files (`package.json`, lockfiles, migrations, central schemas)
   belong to exactly one packet, or to the controller.
 - A packet that needs to read a file another packet owns should list it under
-  `readonly_paths` and depend on that packet.
+  `readonly_paths` **and** declare it in `depends_on`. The dependency is what
+  actually matters: a dependent packet's workspace is seeded with its
+  dependencies' completed results, so without it the packet inspects a tree
+  that does not contain the work yet. Test and audit packets almost always
+  want this.
 
 ## The action protocol
 
