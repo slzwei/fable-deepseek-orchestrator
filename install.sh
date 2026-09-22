@@ -11,21 +11,29 @@
 # enough to read.
 #
 # Usage:
-#   ./install.sh                 install to ~/.codex/skills
+#   ./install.sh                 install to ~/.codex/skills (Codex)
+#   ./install.sh --claude        install to ~/.claude/skills (Claude Code)
+#   ./install.sh --all           install to both
 #   ./install.sh --prefix DIR    install somewhere else
 #   ./install.sh --dry-run       print what would happen, change nothing
 #   ./install.sh --uninstall     remove a previous installation
 #   ./install.sh --check         verify an installation is complete
+#
+# The skill works from either host: the SKILL.md frontmatter format is the same,
+# and the orchestrator itself is a plain Python CLI that any agent can call.
 
 set -euo pipefail
 
 SKILL_NAME="fable-deepseek-orchestrator"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${FABDS_PREFIX:-$HOME/.codex/skills}"
+PREFIXES=""
 MODE="install"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --claude)    PREFIX="$HOME/.claude/skills"; shift ;;
+    --all)       PREFIXES="$HOME/.codex/skills $HOME/.claude/skills"; shift ;;
     --prefix)    PREFIX="$2"; shift 2 ;;
     --prefix=*)  PREFIX="${1#*=}"; shift ;;
     --dry-run)   MODE="dry-run"; shift ;;
@@ -35,6 +43,13 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "$PREFIXES" ]; then
+  for prefix in $PREFIXES; do
+    "$0" --prefix "$prefix" ${MODE:+$([ "$MODE" = "install" ] || echo "--$MODE")} || exit 1
+  done
+  exit 0
+fi
 
 TARGET="$PREFIX/$SKILL_NAME"
 
@@ -152,6 +167,12 @@ LAUNCHER
 
 chmod 755 "$TARGET/scripts/orchestrate" "$TARGET/scripts/doctor"
 say "  installed scripts/orchestrate, scripts/doctor"
+
+# The examples in SKILL.md quote an absolute path. Point them at the real one so
+# the skill works the same from ~/.codex/skills and ~/.claude/skills.
+ESCAPED=$(printf '%s' "$TARGET" | sed 's/[&/\]/\\&/g')
+sed -i.bak "s|SKILL=~/.codex/skills/fable-deepseek-orchestrator|SKILL=$ESCAPED|" \
+  "$TARGET/SKILL.md" && rm -f "$TARGET/SKILL.md.bak"
 
 say ""
 say "installed. next:"

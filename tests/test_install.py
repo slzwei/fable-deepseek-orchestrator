@@ -163,3 +163,24 @@ def test_package_has_no_third_party_imports():
             for name in names:
                 assert name in stdlib or name == "fabds", (
                     f"{path.name} imports third-party module {name!r}")
+
+
+def test_installs_for_claude_code_as_well(fake_home):
+    """The same skill works from ~/.claude/skills; the frontmatter format is shared."""
+    run_install("--claude", home=fake_home)
+    target = fake_home / ".claude" / "skills" / "fable-deepseek-orchestrator"
+    assert (target / "SKILL.md").is_file()
+    assert os.access(target / "scripts" / "orchestrate", os.X_OK)
+    # The examples must point at where it actually landed, not the Codex path.
+    skill = (target / "SKILL.md").read_text(encoding="utf-8")
+    assert f"SKILL={target}" in skill
+    assert ".codex/skills/fable-deepseek-orchestrator\n" not in skill
+    assert not (target / "SKILL.md.bak").exists(), "sed backup must be cleaned up"
+
+
+def test_all_installs_to_both_hosts(fake_home):
+    run_install("--all", home=fake_home)
+    for host in (".codex", ".claude"):
+        target = fake_home / host / "skills" / "fable-deepseek-orchestrator"
+        assert (target / "orchestrator" / "fabds" / "cli.py").is_file(), host
+        assert f"SKILL={target}" in (target / "SKILL.md").read_text(encoding="utf-8")
